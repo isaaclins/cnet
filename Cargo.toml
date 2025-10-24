@@ -8,3 +8,6 @@ license = "MIT"
 
 [dependencies]
 crossterm = "0.27"
+get_if_addrs = "0.5"
+ipnetwork = "0.20"
+rayon = "1.10"
