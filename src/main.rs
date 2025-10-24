@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::io::{stdout, ErrorKind, Stdout, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream};
-use std::time::Duration;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
@@ -12,7 +14,6 @@ use crossterm::{
 };
 use get_if_addrs::{get_if_addrs, IfAddr};
 use ipnetwork::Ipv4Network;
-use rayon::prelude::*;
 use reqwest::blocking::Client;
 use reqwest::header::ACCEPT;
 use serde::Deserialize;
@@ -40,12 +41,42 @@ enum ViewState {
     },
 }
 
+struct Spinner {
+    frame: usize,
+}
+
+impl Spinner {
+    fn new() -> Self {
+        Spinner { frame: 0 }
+    }
+
+    fn advance(&mut self) {
+        self.frame = (self.frame + 1) % 3;
+    }
+
+    fn text(&self) -> String {
+        format!("Scanning{}", ".".repeat(self.frame + 1))
+    }
+}
+
+struct UiStatus<'a> {
+    spinner_text: Option<&'a str>,
+    scan_complete: bool,
+}
+
+enum ScanMessage {
+    HostProgress {
+        processed: usize,
+        report: Option<HostReport>,
+    },
+    Finished,
+}
+
 fn main() -> std::io::Result<()> {
-    println!("Scanning local network. This may take a few seconds...");
-    let mut scan_results = match scan_network() {
-        Ok(results) => results,
+    let (mut scan_results, scan_rx) = match start_scan() {
+        Ok(result) => result,
         Err(err) => {
-            eprintln!("Failed to scan network: {err}");
+            eprintln!("Failed to start scan: {err}");
             return Ok(());
         }
     };
@@ -54,7 +85,7 @@ fn main() -> std::io::Result<()> {
     terminal::enable_raw_mode()?;
     execute!(stdout, EnterAlternateScreen, Hide)?;
 
-    let outcome = run_app(&mut stdout, &mut scan_results);
+    let outcome = run_app(&mut stdout, &mut scan_results, scan_rx);
 
     execute!(stdout, Show, LeaveAlternateScreen)?;
     terminal::disable_raw_mode()?;
@@ -105,15 +136,69 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-fn run_app(stdout: &mut Stdout, scan: &mut ScanResults) -> Result<Option<Selection>, String> {
+fn run_app(
+    stdout: &mut Stdout,
+    scan: &mut ScanResults,
+    scan_rx: Receiver<ScanMessage>,
+) -> Result<Option<Selection>, String> {
     let mut state = ViewState::Hosts { selected: 0 };
     let mut checker = PublicAccessChecker::new();
+    let mut spinner = Spinner::new();
+    let mut spinner_text = Some(spinner.text());
+    let spinner_interval = Duration::from_millis(400);
+    let mut last_tick = Instant::now();
+    let mut force_draw = true;
 
     drain_pending_events().map_err(|err| err.to_string())?;
 
     loop {
-        draw(stdout, &state, scan, &mut checker).map_err(|err| err.to_string())?;
+        let mut needs_draw = force_draw;
 
+        loop {
+            match scan_rx.try_recv() {
+                Ok(ScanMessage::HostProgress { processed, report }) => {
+                    scan.hosts_considered = processed;
+                    if let Some(host) = report {
+                        scan.insert_host(host);
+                    }
+                    needs_draw = true;
+                }
+                Ok(ScanMessage::Finished) => {
+                    scan.scan_complete = true;
+                    spinner_text = None;
+                    needs_draw = true;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    scan.scan_complete = true;
+                    spinner_text = None;
+                    break;
+                }
+            }
+        }
+
+        if !scan.scan_complete && last_tick.elapsed() >= spinner_interval {
+            spinner.advance();
+            spinner_text = Some(spinner.text());
+            last_tick = Instant::now();
+            needs_draw = true;
+        }
+
+        if needs_draw {
+            let status = UiStatus {
+                spinner_text: spinner_text.as_deref(),
+                scan_complete: scan.scan_complete,
+            };
+            draw(stdout, &state, scan, &mut checker, &status).map_err(|err| err.to_string())?;
+            force_draw = false;
+        }
+
+        let timeout = Duration::from_millis(100);
+        if !event::poll(timeout).map_err(|err| err.to_string())? {
+            continue;
+        }
+
+        let mut state_changed = false;
         match event::read() {
             Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => match key.code {
                 KeyCode::Up => match &mut state {
@@ -124,6 +209,7 @@ fn run_app(stdout: &mut Stdout, scan: &mut ScanResults) -> Result<Option<Selecti
                             } else {
                                 *selected - 1
                             };
+                            state_changed = true;
                         }
                     }
                     ViewState::Ports {
@@ -137,6 +223,7 @@ fn run_app(stdout: &mut Stdout, scan: &mut ScanResults) -> Result<Option<Selecti
                                 } else {
                                     *port_index - 1
                                 };
+                                state_changed = true;
                             }
                         }
                     }
@@ -145,6 +232,7 @@ fn run_app(stdout: &mut Stdout, scan: &mut ScanResults) -> Result<Option<Selecti
                     ViewState::Hosts { selected } => {
                         if !scan.hosts.is_empty() {
                             *selected = (*selected + 1) % scan.hosts.len();
+                            state_changed = true;
                         }
                     }
                     ViewState::Ports {
@@ -154,6 +242,7 @@ fn run_app(stdout: &mut Stdout, scan: &mut ScanResults) -> Result<Option<Selecti
                         if let Some(host) = scan.hosts.get(*host_index) {
                             if !host.ports.is_empty() {
                                 *port_index = (*port_index + 1) % host.ports.len();
+                                state_changed = true;
                             }
                         }
                     }
@@ -167,6 +256,7 @@ fn run_app(stdout: &mut Stdout, scan: &mut ScanResults) -> Result<Option<Selecti
                                 } else {
                                     *selected - 1
                                 };
+                                state_changed = true;
                             }
                         }
                     }
@@ -174,12 +264,14 @@ fn run_app(stdout: &mut Stdout, scan: &mut ScanResults) -> Result<Option<Selecti
                         state = ViewState::Hosts {
                             selected: host_index.min(scan.hosts.len().saturating_sub(1)),
                         };
+                        state_changed = true;
                     }
                 },
                 KeyCode::Right => match &mut state {
                     ViewState::Hosts { selected } => {
                         if !scan.hosts.is_empty() {
                             *selected = (*selected + 1) % scan.hosts.len();
+                            state_changed = true;
                         }
                     }
                     ViewState::Ports {
@@ -189,6 +281,7 @@ fn run_app(stdout: &mut Stdout, scan: &mut ScanResults) -> Result<Option<Selecti
                         if let Some(host) = scan.hosts.get(*host_index) {
                             if !host.ports.is_empty() {
                                 *port_index = (*port_index + 1) % host.ports.len();
+                                state_changed = true;
                             }
                         }
                     }
@@ -198,6 +291,7 @@ fn run_app(stdout: &mut Stdout, scan: &mut ScanResults) -> Result<Option<Selecti
                         state = ViewState::Hosts {
                             selected: host_index.min(scan.hosts.len().saturating_sub(1)),
                         };
+                        state_changed = true;
                     }
                 }
                 KeyCode::Enter => match state {
@@ -210,6 +304,7 @@ fn run_app(stdout: &mut Stdout, scan: &mut ScanResults) -> Result<Option<Selecti
                                         host_index: safe_index,
                                         port_index: 0,
                                     };
+                                    state_changed = true;
                                 }
                             }
                         }
@@ -227,9 +322,15 @@ fn run_app(stdout: &mut Stdout, scan: &mut ScanResults) -> Result<Option<Selecti
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(None),
                 _ => {}
             },
-            Ok(Event::Resize(_, _)) => {}
+            Ok(Event::Resize(_, _)) => {
+                state_changed = true;
+            }
             Ok(_) => {}
             Err(err) => return Err(err.to_string()),
+        }
+
+        if state_changed {
+            force_draw = true;
         }
     }
 }
@@ -246,20 +347,26 @@ fn draw(
     state: &ViewState,
     scan: &mut ScanResults,
     checker: &mut PublicAccessChecker,
+    status: &UiStatus,
 ) -> std::io::Result<()> {
     execute!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
     match *state {
-        ViewState::Hosts { selected } => draw_host_view(stdout, scan, selected)?,
+        ViewState::Hosts { selected } => draw_host_view(stdout, scan, selected, status)?,
         ViewState::Ports {
             host_index,
             port_index,
-        } => draw_port_view(stdout, scan, host_index, port_index, checker)?,
+        } => draw_port_view(stdout, scan, host_index, port_index, checker, status)?,
     }
     stdout.flush()?;
     Ok(())
 }
 
-fn draw_host_view(stdout: &mut Stdout, scan: &ScanResults, selected: usize) -> std::io::Result<()> {
+fn draw_host_view(
+    stdout: &mut Stdout,
+    scan: &ScanResults,
+    selected: usize,
+    status: &UiStatus,
+) -> std::io::Result<()> {
     let layout = compute_layout(scan);
 
     execute!(
@@ -270,7 +377,7 @@ fn draw_host_view(stdout: &mut Stdout, scan: &ScanResults, selected: usize) -> s
             "Local IP: {} | Hosts probed: {} / {} | Hosts with open ports: {}\r\n",
             scan.local_ip,
             scan.hosts_considered,
-            scan.hosts_available,
+            scan.hosts_planned,
             scan.hosts.len()
         )),
         Print(format!(
@@ -279,14 +386,18 @@ fn draw_host_view(stdout: &mut Stdout, scan: &ScanResults, selected: usize) -> s
         )),
     )?;
 
-    if scan.hosts_considered < scan.hosts_available {
+    if scan.hosts_planned < scan.hosts_available {
         execute!(
             stdout,
             Print(format!(
                 "Note: scan limited to first {} of {} hosts. Adjust MAX_HOSTS_TO_SCAN to widen coverage.\r\n",
-                scan.hosts_considered, scan.hosts_available
+                scan.hosts_planned, scan.hosts_available
             ))
         )?;
+    }
+
+    if let Some(text) = status.spinner_text {
+        execute!(stdout, Print(format!("{}\r\n", text)))?;
     }
 
     execute!(stdout, Print("\r\n"))?;
@@ -359,6 +470,15 @@ fn draw_host_view(stdout: &mut Stdout, scan: &ScanResults, selected: usize) -> s
         Print("\r\nUse ↑/↓ or ←/→ to browse hosts, Enter to inspect, q or Esc to quit.\r\n")
     )?;
 
+    if status.scan_complete {
+        execute!(
+            stdout,
+            SetForegroundColor(Color::Green),
+            Print("Done scanning\r\n"),
+            ResetColor
+        )?;
+    }
+
     Ok(())
 }
 
@@ -368,6 +488,7 @@ fn draw_port_view(
     host_index: usize,
     port_index: usize,
     checker: &mut PublicAccessChecker,
+    status: &UiStatus,
 ) -> std::io::Result<()> {
     if let Some(host) = scan.hosts.get_mut(host_index) {
         for port in &mut host.ports {
@@ -386,6 +507,10 @@ fn draw_port_view(
             Print(format!("|{title}|\r\n")),
             Print(title_border)
         )?;
+
+        if let Some(text) = status.spinner_text {
+            execute!(stdout, Print(format!("{}\r\n", text)))?;
+        }
 
         let border = format!(
             "+{}+{}+{}+{}+\r\n",
@@ -454,6 +579,15 @@ fn draw_port_view(
                 "\r\nUse ↑/↓ to browse ports, Enter to finish, ← or Backspace to return, q or Esc to quit.\r\n"
             )
         )?;
+
+        if status.scan_complete {
+            execute!(
+                stdout,
+                SetForegroundColor(Color::Green),
+                Print("Done scanning\r\n"),
+                ResetColor
+            )?;
+        }
     } else {
         execute!(
             stdout,
@@ -504,7 +638,7 @@ fn compute_layout(scan: &ScanResults) -> TableLayout {
     }
 }
 
-fn scan_network() -> Result<ScanResults, String> {
+fn start_scan() -> Result<(ScanResults, Receiver<ScanMessage>), String> {
     let interfaces = get_if_addrs().map_err(|err| err.to_string())?;
     let interface = interfaces
         .into_iter()
@@ -537,7 +671,8 @@ fn scan_network() -> Result<ScanResults, String> {
         .filter(|ip| *ip != network_addr && *ip != broadcast_addr && *ip != v4.ip)
         .take(MAX_HOSTS_TO_SCAN)
         .collect();
-    let hosts_considered = host_ips.len();
+    let hosts_planned = host_ips.len();
+
     let ports = default_port_list();
     let ports_display = ports
         .iter()
@@ -545,22 +680,37 @@ fn scan_network() -> Result<ScanResults, String> {
         .collect::<Vec<_>>()
         .join(", ");
 
-    let mut hosts: Vec<HostReport> = host_ips
-        .into_par_iter()
-        .filter_map(|ip| scan_host(ip, &ports))
-        .collect();
+    let (tx, rx) = mpsc::channel();
+    let thread_ports = ports.clone();
 
-    hosts.sort_by(|a, b| a.ip_addr.cmp(&b.ip_addr));
+    thread::spawn(move || {
+        for (index, ip) in host_ips.into_iter().enumerate() {
+            let processed = index + 1;
+            let report = scan_host(ip, &thread_ports);
+            if tx
+                .send(ScanMessage::HostProgress { processed, report })
+                .is_err()
+            {
+                return;
+            }
+        }
 
-    Ok(ScanResults {
-        hosts,
-        hosts_considered,
+        let _ = tx.send(ScanMessage::Finished);
+    });
+
+    let scan_results = ScanResults {
+        hosts: Vec::new(),
+        hosts_considered: 0,
         hosts_available,
+        hosts_planned,
         ports_checked: ports.len(),
         ports_display,
         network: effective_network.to_string(),
         local_ip: v4.ip,
-    })
+        scan_complete: false,
+    };
+
+    Ok((scan_results, rx))
 }
 
 fn host_is_reachable(ip: Ipv4Addr) -> bool {
@@ -731,10 +881,12 @@ struct ScanResults {
     hosts: Vec<HostReport>,
     hosts_considered: usize,
     hosts_available: usize,
+    hosts_planned: usize,
     ports_checked: usize,
     ports_display: String,
     network: String,
     local_ip: Ipv4Addr,
+    scan_complete: bool,
 }
 
 struct HostReport {
@@ -743,6 +895,18 @@ struct HostReport {
     ports: Vec<PortInfo>,
     ports_display: String,
     services_display: String,
+}
+
+impl ScanResults {
+    fn insert_host(&mut self, host: HostReport) {
+        match self
+            .hosts
+            .binary_search_by(|existing| existing.ip_addr.cmp(&host.ip_addr))
+        {
+            Ok(idx) => self.hosts[idx] = host,
+            Err(idx) => self.hosts.insert(idx, host),
+        }
+    }
 }
 
 impl HostReport {

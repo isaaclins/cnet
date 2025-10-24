@@ -10,6 +10,5 @@ license = "MIT"
 crossterm = "0.27"
 get_if_addrs = "0.5"
 ipnetwork = "0.20"
-rayon = "1.10"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
 serde = { version = "1.0", features = ["derive"] }
