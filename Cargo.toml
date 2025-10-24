@@ -1,0 +1,10 @@
+[package]
+name = "cnet"
+version = "0.1.0"
+edition = "2021"
+
+description = "Interactive terminal selector for numbers 1 through 10"
+license = "MIT"
+
+[dependencies]
+crossterm = "0.27"
