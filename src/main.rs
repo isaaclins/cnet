@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{stdout, ErrorKind, Stdout, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream};
 use std::time::Duration;
@@ -12,6 +13,9 @@ use crossterm::{
 use get_if_addrs::{get_if_addrs, IfAddr};
 use ipnetwork::Ipv4Network;
 use rayon::prelude::*;
+use reqwest::blocking::Client;
+use reqwest::header::ACCEPT;
+use serde::Deserialize;
 
 const CONNECT_TIMEOUT_MS: u64 = 200;
 const PROBE_TIMEOUT_MS: u64 = 60;
@@ -38,7 +42,7 @@ enum ViewState {
 
 fn main() -> std::io::Result<()> {
     println!("Scanning local network. This may take a few seconds...");
-    let scan_results = match scan_network() {
+    let mut scan_results = match scan_network() {
         Ok(results) => results,
         Err(err) => {
             eprintln!("Failed to scan network: {err}");
@@ -50,7 +54,7 @@ fn main() -> std::io::Result<()> {
     terminal::enable_raw_mode()?;
     execute!(stdout, EnterAlternateScreen, Hide)?;
 
-    let outcome = run_app(&mut stdout, &scan_results);
+    let outcome = run_app(&mut stdout, &mut scan_results);
 
     execute!(stdout, Show, LeaveAlternateScreen)?;
     terminal::disable_raw_mode()?;
@@ -62,9 +66,21 @@ fn main() -> std::io::Result<()> {
                     println!("Host: {}", host.ip);
                     println!("Port: {}", port.port);
                     println!("Service: {}", port.service.unwrap_or("unknown service"));
-                    match &port.url {
-                        Some(url) => println!("URL: {url}"),
-                        None => println!("URL: (unknown)"),
+                    println!("URL: {}", port.url_display);
+                    match &port.public_status {
+                        PublicStatus::Accessible {
+                            ip,
+                            port: public_port,
+                        } => {
+                            println!("Public endpoint: {ip}:{public_port}")
+                        }
+                        PublicStatus::NotAccessible => {
+                            println!("Public endpoint: not reachable")
+                        }
+                        PublicStatus::Unknown => println!("Public endpoint: unknown"),
+                        PublicStatus::Error(msg) => {
+                            println!("Public check failed: {msg}")
+                        }
                     }
                 } else {
                     println!(
@@ -89,19 +105,62 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-fn run_app(stdout: &mut Stdout, scan: &ScanResults) -> Result<Option<Selection>, String> {
+fn run_app(stdout: &mut Stdout, scan: &mut ScanResults) -> Result<Option<Selection>, String> {
     let mut state = ViewState::Hosts { selected: 0 };
+    let mut checker = PublicAccessChecker::new();
 
     drain_pending_events().map_err(|err| err.to_string())?;
 
     loop {
-        draw(stdout, state, scan).map_err(|err| err.to_string())?;
+        draw(stdout, &state, scan, &mut checker).map_err(|err| err.to_string())?;
 
         match event::read() {
-            Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
-                match key.code {
-                    KeyCode::Up => match &mut state {
-                        ViewState::Hosts { selected } => {
+            Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Up => match &mut state {
+                    ViewState::Hosts { selected } => {
+                        if !scan.hosts.is_empty() {
+                            *selected = if *selected == 0 {
+                                scan.hosts.len() - 1
+                            } else {
+                                *selected - 1
+                            };
+                        }
+                    }
+                    ViewState::Ports {
+                        host_index,
+                        port_index,
+                    } => {
+                        if let Some(host) = scan.hosts.get(*host_index) {
+                            if !host.ports.is_empty() {
+                                *port_index = if *port_index == 0 {
+                                    host.ports.len() - 1
+                                } else {
+                                    *port_index - 1
+                                };
+                            }
+                        }
+                    }
+                },
+                KeyCode::Down => match &mut state {
+                    ViewState::Hosts { selected } => {
+                        if !scan.hosts.is_empty() {
+                            *selected = (*selected + 1) % scan.hosts.len();
+                        }
+                    }
+                    ViewState::Ports {
+                        host_index,
+                        port_index,
+                    } => {
+                        if let Some(host) = scan.hosts.get(*host_index) {
+                            if !host.ports.is_empty() {
+                                *port_index = (*port_index + 1) % host.ports.len();
+                            }
+                        }
+                    }
+                },
+                KeyCode::Left => match state {
+                    ViewState::Hosts { .. } => {
+                        if let ViewState::Hosts { selected } = &mut state {
                             if !scan.hosts.is_empty() {
                                 *selected = if *selected == 0 {
                                     scan.hosts.len() - 1
@@ -110,110 +169,64 @@ fn run_app(stdout: &mut Stdout, scan: &ScanResults) -> Result<Option<Selection>,
                                 };
                             }
                         }
-                        ViewState::Ports {
-                            host_index,
-                            port_index,
-                        } => {
-                            if let Some(host) = scan.hosts.get(*host_index) {
-                                if !host.ports.is_empty() {
-                                    *port_index = if *port_index == 0 {
-                                        host.ports.len() - 1
-                                    } else {
-                                        *port_index - 1
-                                    };
-                                }
-                            }
-                        }
-                    },
-                    KeyCode::Down => match &mut state {
-                        ViewState::Hosts { selected } => {
-                            if !scan.hosts.is_empty() {
-                                *selected = (*selected + 1) % scan.hosts.len();
-                            }
-                        }
-                        ViewState::Ports {
-                            host_index,
-                            port_index,
-                        } => {
-                            if let Some(host) = scan.hosts.get(*host_index) {
-                                if !host.ports.is_empty() {
-                                    *port_index = (*port_index + 1) % host.ports.len();
-                                }
-                            }
-                        }
-                    },
-                    KeyCode::Left => match state {
-                        ViewState::Hosts { .. } => {
-                            if let ViewState::Hosts { selected } = &mut state {
-                                if !scan.hosts.is_empty() {
-                                    *selected = if *selected == 0 {
-                                        scan.hosts.len() - 1
-                                    } else {
-                                        *selected - 1
-                                    };
-                                }
-                            }
-                        }
-                        ViewState::Ports { host_index, .. } => {
-                            state = ViewState::Hosts {
-                                selected: host_index.min(scan.hosts.len().saturating_sub(1)),
-                            };
-                        }
-                    },
-                    KeyCode::Right => match &mut state {
-                        ViewState::Hosts { selected } => {
-                            if !scan.hosts.is_empty() {
-                                *selected = (*selected + 1) % scan.hosts.len();
-                            }
-                        }
-                        ViewState::Ports {
-                            host_index,
-                            port_index,
-                        } => {
-                            if let Some(host) = scan.hosts.get(*host_index) {
-                                if !host.ports.is_empty() {
-                                    *port_index = (*port_index + 1) % host.ports.len();
-                                }
-                            }
-                        }
-                    },
-                    KeyCode::Backspace => {
-                        if let ViewState::Ports { host_index, .. } = state {
-                            state = ViewState::Hosts {
-                                selected: host_index.min(scan.hosts.len().saturating_sub(1)),
-                            };
+                    }
+                    ViewState::Ports { host_index, .. } => {
+                        state = ViewState::Hosts {
+                            selected: host_index.min(scan.hosts.len().saturating_sub(1)),
+                        };
+                    }
+                },
+                KeyCode::Right => match &mut state {
+                    ViewState::Hosts { selected } => {
+                        if !scan.hosts.is_empty() {
+                            *selected = (*selected + 1) % scan.hosts.len();
                         }
                     }
-                    KeyCode::Enter => match state {
-                        ViewState::Hosts { selected } => {
-                            if !scan.hosts.is_empty() {
-                                let safe_index = selected % scan.hosts.len();
-                                if let Some(host) = scan.hosts.get(safe_index) {
-                                    if host.ports.is_empty() {
-                                        // Nothing to inspect on this host.
-                                    } else {
-                                        state = ViewState::Ports {
-                                            host_index: safe_index,
-                                            port_index: 0,
-                                        };
-                                    }
+                    ViewState::Ports {
+                        host_index,
+                        port_index,
+                    } => {
+                        if let Some(host) = scan.hosts.get(*host_index) {
+                            if !host.ports.is_empty() {
+                                *port_index = (*port_index + 1) % host.ports.len();
+                            }
+                        }
+                    }
+                },
+                KeyCode::Backspace => {
+                    if let ViewState::Ports { host_index, .. } = state {
+                        state = ViewState::Hosts {
+                            selected: host_index.min(scan.hosts.len().saturating_sub(1)),
+                        };
+                    }
+                }
+                KeyCode::Enter => match state {
+                    ViewState::Hosts { selected } => {
+                        if !scan.hosts.is_empty() {
+                            let safe_index = selected % scan.hosts.len();
+                            if let Some(host) = scan.hosts.get(safe_index) {
+                                if !host.ports.is_empty() {
+                                    state = ViewState::Ports {
+                                        host_index: safe_index,
+                                        port_index: 0,
+                                    };
                                 }
                             }
                         }
-                        ViewState::Ports {
+                    }
+                    ViewState::Ports {
+                        host_index,
+                        port_index,
+                    } => {
+                        return Ok(Some(Selection {
                             host_index,
                             port_index,
-                        } => {
-                            return Ok(Some(Selection {
-                                host_index,
-                                port_index,
-                            }));
-                        }
-                    },
-                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(None),
-                    _ => {}
-                }
-            }
+                        }));
+                    }
+                },
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(None),
+                _ => {}
+            },
             Ok(Event::Resize(_, _)) => {}
             Ok(_) => {}
             Err(err) => return Err(err.to_string()),
@@ -228,14 +241,19 @@ fn drain_pending_events() -> std::io::Result<()> {
     Ok(())
 }
 
-fn draw(stdout: &mut Stdout, state: ViewState, scan: &ScanResults) -> std::io::Result<()> {
+fn draw(
+    stdout: &mut Stdout,
+    state: &ViewState,
+    scan: &mut ScanResults,
+    checker: &mut PublicAccessChecker,
+) -> std::io::Result<()> {
     execute!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
-    match state {
+    match *state {
         ViewState::Hosts { selected } => draw_host_view(stdout, scan, selected)?,
         ViewState::Ports {
             host_index,
             port_index,
-        } => draw_port_view(stdout, scan, host_index, port_index)?,
+        } => draw_port_view(stdout, scan, host_index, port_index, checker)?,
     }
     stdout.flush()?;
     Ok(())
@@ -346,11 +364,20 @@ fn draw_host_view(stdout: &mut Stdout, scan: &ScanResults, selected: usize) -> s
 
 fn draw_port_view(
     stdout: &mut Stdout,
-    scan: &ScanResults,
+    scan: &mut ScanResults,
     host_index: usize,
     port_index: usize,
+    checker: &mut PublicAccessChecker,
 ) -> std::io::Result<()> {
-    if let Some(host) = scan.hosts.get(host_index) {
+    if let Some(host) = scan.hosts.get_mut(host_index) {
+        for port in &mut host.ports {
+            if matches!(port.public_status, PublicStatus::Unknown) {
+                let status = checker.check_port(host.ip_addr, scan.local_ip, port.port);
+                port.set_public_status(status);
+            }
+        }
+
+        let layout = compute_port_layout(host);
         let title = format!(" {} ", host.ip);
         let title_border = format!("+{}+\r\n", "-".repeat(title.len()));
         execute!(
@@ -360,21 +387,23 @@ fn draw_port_view(
             Print(title_border)
         )?;
 
-        let layout = compute_port_layout(host);
         let border = format!(
-            "+{}+{}+{}+\r\n",
+            "+{}+{}+{}+{}+\r\n",
             "-".repeat(layout.port_width + 2),
             "-".repeat(layout.service_width + 2),
-            "-".repeat(layout.url_width + 2)
+            "-".repeat(layout.url_width + 2),
+            "-".repeat(layout.public_width + 2)
         );
         let header = format!(
-            "| {:^port_w$} | {:^service_w$} | {:^url_w$} |\r\n",
+            "| {:^port_w$} | {:^service_w$} | {:^url_w$} | {:^public_w$} |\r\n",
             "Port",
             "Service",
             "URL",
+            "Public",
             port_w = layout.port_width,
             service_w = layout.service_width,
-            url_w = layout.url_width
+            url_w = layout.url_width,
+            public_w = layout.public_width
         );
 
         execute!(
@@ -393,13 +422,15 @@ fn draw_port_view(
         for (row_idx, port) in host.ports.iter().enumerate() {
             let label = port.service.unwrap_or("unknown");
             let line = format!(
-                "| {:>port_w$} | {:<service_w$} | {:<url_w$} |\r\n",
+                "| {:>port_w$} | {:<service_w$} | {:<url_w$} | {:<public_w$} |\r\n",
                 port.port,
                 label,
                 port.url_display,
+                port.public_label,
                 port_w = layout.port_width,
                 service_w = layout.service_width,
-                url_w = layout.url_width
+                url_w = layout.url_width,
+                public_w = layout.public_width
             );
 
             if Some(row_idx) == highlight {
@@ -437,18 +468,21 @@ fn compute_port_layout(host: &HostReport) -> PortTableLayout {
     let mut port_width = "Port".len();
     let mut service_width = "Service".len();
     let mut url_width = "URL".len();
+    let mut public_width = "Public".len();
 
     for port in &host.ports {
         port_width = port_width.max(port.port.to_string().len());
         let label = port.service.unwrap_or("unknown");
         service_width = service_width.max(label.len());
         url_width = url_width.max(port.url_display.len());
+        public_width = public_width.max(port.public_label.len());
     }
 
     PortTableLayout {
         port_width,
         service_width,
         url_width,
+        public_width,
     }
 }
 
@@ -577,8 +611,9 @@ fn scan_host(ip: Ipv4Addr, ports: &[u16]) -> Option<HostReport> {
                 open_ports.push(PortInfo {
                     port: *port,
                     service,
-                    url,
                     url_display,
+                    public_status: PublicStatus::Unknown,
+                    public_label: String::from("pending"),
                 });
             }
             Err(err) => {
@@ -749,8 +784,35 @@ impl HostReport {
 struct PortInfo {
     port: u16,
     service: Option<&'static str>,
-    url: Option<String>,
     url_display: String,
+    public_status: PublicStatus,
+    public_label: String,
+}
+
+#[derive(Clone, Debug)]
+enum PublicStatus {
+    Accessible { ip: String, port: u16 },
+    NotAccessible,
+    Unknown,
+    Error(String),
+}
+
+impl PublicStatus {
+    fn label(&self) -> String {
+        match self {
+            PublicStatus::Accessible { ip, port } => format!("{ip}:{port}"),
+            PublicStatus::NotAccessible => "private".to_string(),
+            PublicStatus::Unknown => "pending".to_string(),
+            PublicStatus::Error(msg) => format!("error: {msg}"),
+        }
+    }
+}
+
+impl PortInfo {
+    fn set_public_status(&mut self, status: PublicStatus) {
+        self.public_status = status;
+        self.public_label = self.public_status.label();
+    }
 }
 
 struct TableLayout {
@@ -763,4 +825,120 @@ struct PortTableLayout {
     port_width: usize,
     service_width: usize,
     url_width: usize,
+    public_width: usize,
+}
+
+struct PublicAccessChecker {
+    client: Client,
+    cache: HashMap<(Ipv4Addr, u16), PublicStatus>,
+}
+
+impl PublicAccessChecker {
+    fn new() -> Self {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap_or_else(|_| Client::new());
+
+        PublicAccessChecker {
+            client,
+            cache: HashMap::new(),
+        }
+    }
+
+    fn check_port(&mut self, host: Ipv4Addr, local_ip: Ipv4Addr, port: u16) -> PublicStatus {
+        if let Some(status) = self.cache.get(&(host, port)) {
+            return status.clone();
+        }
+
+        let status = if host == local_ip {
+            self.check_local_public_port(port)
+        } else if host.is_private() {
+            PublicStatus::NotAccessible
+        } else {
+            self.probe_public_host(host, port)
+        };
+
+        self.cache.insert((host, port), status.clone());
+        status
+    }
+
+    fn check_local_public_port(&self, port: u16) -> PublicStatus {
+        let endpoint = format!("https://ifconfig.co/port/{port}");
+        match self
+            .client
+            .get(&endpoint)
+            .header(ACCEPT, "application/json")
+            .send()
+        {
+            Ok(response) => {
+                if !response.status().is_success() {
+                    return PublicStatus::Error(format!("HTTP {}", response.status().as_u16()));
+                }
+
+                match response.json::<PortCheckResponse>() {
+                    Ok(body) => {
+                        let open = body
+                            .open
+                            .or(body.reachable)
+                            .or_else(|| {
+                                body.status.as_ref().map(|status| {
+                                    matches!(
+                                        status.to_ascii_lowercase().as_str(),
+                                        "open" | "reachable"
+                                    )
+                                })
+                            })
+                            .unwrap_or(false);
+
+                        if open {
+                            let ip = body
+                                .origin
+                                .or(body.ip)
+                                .unwrap_or_else(|| "unknown".to_string());
+                            PublicStatus::Accessible { ip, port }
+                        } else {
+                            PublicStatus::NotAccessible
+                        }
+                    }
+                    Err(err) => PublicStatus::Error(format!("parse: {err}")),
+                }
+            }
+            Err(err) => PublicStatus::Error(err.to_string()),
+        }
+    }
+
+    fn probe_public_host(&self, host: Ipv4Addr, port: u16) -> PublicStatus {
+        let addr = SocketAddr::new(IpAddr::V4(host), port);
+        match TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
+            Ok(stream) => {
+                let _ = stream.shutdown(Shutdown::Both);
+                PublicStatus::Accessible {
+                    ip: host.to_string(),
+                    port,
+                }
+            }
+            Err(err) => match err.kind() {
+                ErrorKind::ConnectionRefused
+                | ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted => PublicStatus::NotAccessible,
+                ErrorKind::TimedOut | ErrorKind::WouldBlock => PublicStatus::NotAccessible,
+                _ => PublicStatus::Error(err.to_string()),
+            },
+        }
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct PortCheckResponse {
+    #[serde(default)]
+    origin: Option<String>,
+    #[serde(default)]
+    ip: Option<String>,
+    #[serde(default)]
+    open: Option<bool>,
+    #[serde(default)]
+    reachable: Option<bool>,
+    #[serde(default)]
+    status: Option<String>,
 }
