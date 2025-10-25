@@ -1,0 +1,194 @@
+Feature: Keyboard shortcuts for host and port actions
+  As a user
+  I want to use keyboard shortcuts
+  So that I can quickly interact with hosts and ports in the TUI
+
+  Scenario: Rescanning a host
+    Given the user is in the Hosts View
+    And the host "192.168.1.1" is selected
+    When the user presses "R" (or equivalent key in the settings)
+    Then the app should re-scan only that host
+    And update the open ports and services in the table
+
+  Scenario: Opening a service in the browser
+    Given the user is in the Ports View for host "192.168.1.1"
+    And the port 80 (HTTP) is selected
+    When the user presses "O" (or equivalent key in the settings)
+    Then the system browser should open "http://192.168.1.1"
+
+  Scenario: Copying IP and port to clipboard
+    Given the user is in the Ports View for host "192.168.1.1"
+    And the port 443 (HTTPS) is selected
+    When the user presses "C" (or equivalent key in the settings)
+    Then the clipboard should contain "192.168.1.1:443"
+
+Feature: Service fingerprinting
+  As a user
+  I want to identify what software and versions are running on each open port
+  So that I can understand my network’s services more precisely
+
+  Scenario: Displaying a service fingerprint
+    Given the scan has detected port 80 open on "192.168.1.1"
+    Then the Ports View should display "nginx 1.25.3" instead of "HTTP"
+    And the fingerprint data should be stored in the scan results
+
+Feature: Hostname and reverse DNS lookup
+  As a user
+  I want to see the DNS or mDNS hostname next to each IP
+  So that I can identify devices more easily
+
+  Scenario: Displaying resolved hostnames
+    Given the user has completed a network scan
+    When a hostname can be resolved for "192.168.1.1"
+    Then the Hosts View should show "192.168.1.1 (router.local)"
+
+  Scenario: Manual DNS resolution
+    Given the user is in the Hosts View
+    When the user presses "D"
+    Then unresolved hosts should attempt reverse DNS lookup
+    And the table should refresh with available hostnames
+
+Feature: Exporting scan results
+  As a user
+  I want to export my scan results to files
+  So that I can review or share them later
+
+  Scenario: Exporting to JSON
+    Given a scan is complete
+    When the user presses "E" (or equivalent key in the settings)
+    Then the app should prompt for export format
+    And if the user selects JSON
+    Then a file "scan_results.json" should be saved in the export directory
+
+  Scenario: Exporting to CSV
+    Given a scan is complete
+    When the user chooses CSV export
+    Then the file "scan_results.csv" should contain the host, ports, and services
+
+  Scenario: Exporting to Markdown
+    Given a scan is complete
+    When the user chooses Markdown export
+    Then the file "scan_results.md" should be created with formatted tables
+
+
+Feature: MAC address and vendor resolution
+  As a user
+  I want to see the MAC address and device vendor for each host
+  So that I can identify hardware manufacturers
+
+  Scenario: Viewing MAC and vendor information
+    Given the user has completed a scan
+    When the user presses "M" (or equivalent key in the settings)
+    Then the app should perform an ARP table lookup
+    And display columns "MAC Address" and "Vendor" in the Hosts View
+    And if a vendor is known, display its name (e.g. "Apple", "TP-Link")
+
+Feature: Graphical network map
+  As a user
+  I want to view a visual representation of the network topology
+  So that I can understand how devices are connected
+
+  Scenario: Opening the network map
+    Given the user has completed a scan
+    When the user presses "G" (or equivalent key in the settings)
+    Then the app should switch to the "Network Map" view
+    And display hosts connected to the router in a tree or ASCII graph layout
+
+  Scenario: Exporting the network map
+    Given the user is viewing the network map
+    When the user presses "E" (or equivalent key in the settings)
+    Then the app should generate "network_map.dot" in Graphviz format
+    And optionally render a PNG if graphviz is installed
+
+Feature: Scan history and comparison
+  As a user
+  I want to compare scans over time
+  So that I can see what changed in my network
+
+  Scenario: Viewing history
+    Given multiple past scans are stored in the history directory
+    When the user presses "H" (or equivalent key in the settings)
+    Then the app should open the History View
+    And display previous scan dates and summary changes
+
+  Scenario: Viewing differences between scans
+    Given the user is in the History View
+    When the user selects a date and presses Enter
+    Then a diff should be displayed showing new and removed hosts
+    And changed ports should be highlighted with "added" or "removed"
+
+  Scenario: Deleting old scans
+    Given the user is in the History View
+    And an old snapshot is selected
+    When the user presses "D" (or equivalent key in the settings)
+    Then the selected scan history file should be deleted
+
+Feature: View navigation
+  As a user
+  I want to navigate between views with the keyboard
+  So that I can quickly switch contexts without the mouse
+
+  Scenario: Switching between views
+    Given the user is in the Hosts View
+    When the user presses Enter
+    Then the app switches to the Ports View
+
+    When the user presses Left Arrow
+    Then the app returns to the Hosts View
+
+    When the user presses "G" (or equivalent key in the settings)
+    Then the app switches to the Network Map
+
+    When the user presses "H" (or equivalent key in the settings)
+    Then the app switches to the History View
+
+
+Feature: Configuration and keybinding management
+  As a user
+  I want to edit and reload configuration files
+  So that I can customize shortcuts and behavior without recompiling the app
+
+  Scenario: Editing config files
+    Given the user has configuration files in "~/.config/cnet/"
+    When the user edits "config.toml" or "keybinds.toml"
+    Then the app should load custom settings on next startup
+
+  Scenario: Reloading configuration at runtime
+    Given the app is running
+    When the user presses "Ctrl+R" (or equivalent)
+    Then all settings and keybindings should reload from "~/.config/cnet/"
+    And the app should show a toast "Configuration reloaded successfully"
+
+  Scenario: Restoring default settings
+    Given the user is in the Settings View
+    When the user presses "D"
+    Then all configurations should reset to default values
+    And overwrite "keybinds.toml" and "config.toml" with defaults
+
+  Scenario: Showing current keybindings
+    Given the user presses "?"
+    Then an overlay should appear listing all current shortcuts
+    And show their current assignments from the config file
+
+
+Feature: Settings view
+  As a user
+  I want to modify runtime parameters from inside the TUI
+  So that I can fine-tune the app without editing config files manually
+
+  Scenario: Opening the settings view
+    Given the user presses "S" (or equivalent)
+    Then the app switches to the Settings View
+    And shows adjustable fields such as "Scan timeout", "Export format", and "Default interface"
+
+  Scenario: Changing a setting
+    Given the user is in the Settings View
+    When they adjust the "Scan timeout" value
+    And press Save
+    Then the new value should take effect immediately
+    And persist in the configuration file
+
+  Scenario: Canceling a change
+    Given the user is in the Settings View
+    When they make a change and press Cancel
+    Then the app should not modify any configuration
