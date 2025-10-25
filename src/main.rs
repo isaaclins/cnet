@@ -1,3 +1,4 @@
+use dns_lookup::lookup_addr;
 use std::collections::HashMap;
 use std::io::{stdout, ErrorKind, Read, Stdout, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream as BlockingTcpStream};
@@ -36,6 +37,7 @@ const MAX_HOSTS_TO_SCAN: usize = 512;
 const HOST_CONCURRENCY: usize = 64;
 const PROBE_PORTS: &[u16] = &[1, 22, 80];
 const MAX_FINGERPRINT_LEN: usize = 80;
+const MAX_HOSTNAME_LEN: usize = 80;
 
 #[derive(Clone, Copy)]
 struct Selection {
@@ -113,6 +115,9 @@ fn main() -> std::io::Result<()> {
                         .as_deref()
                         .unwrap_or_else(|| port.service.unwrap_or("unknown service"));
                     println!("Host: {}", host.ip);
+                    if let Some(hostname) = host.hostname() {
+                        println!("Hostname: {hostname}");
+                    }
                     println!("Port: {}", port.port);
                     println!("Service: {}", service_label);
                     if let Some(fingerprint) = &port.fingerprint {
@@ -389,6 +394,43 @@ fn run_app(
                         state_changed = true;
                     }
                 }
+                KeyCode::Char('d') | KeyCode::Char('D') => {
+                    if matches!(state, ViewState::Hosts { .. }) {
+                        if scan.hosts.is_empty() {
+                            status_message = Some("No hosts discovered yet.".to_string());
+                        } else {
+                            let unresolved: Vec<Ipv4Addr> = scan
+                                .hosts
+                                .iter()
+                                .filter(|host| host.hostname().is_none())
+                                .map(|host| host.ip_addr)
+                                .collect();
+
+                            if unresolved.is_empty() {
+                                status_message =
+                                    Some("All hosts already have hostnames.".to_string());
+                            } else {
+                                let resolved = resolve_hostnames_blocking(&unresolved);
+                                if resolved.is_empty() {
+                                    status_message =
+                                        Some("No hostnames could be resolved.".to_string());
+                                } else {
+                                    let count = resolved.len();
+                                    for host in &mut scan.hosts {
+                                        if let Some(name) = resolved.get(&host.ip_addr) {
+                                            host.set_hostname(Some(name.clone()));
+                                        }
+                                    }
+                                    let plural = if count == 1 { "" } else { "s" };
+                                    status_message =
+                                        Some(format!("Resolved {count} hostname{plural}."));
+                                }
+                            }
+                        }
+                        force_draw = true;
+                        state_changed = true;
+                    }
+                }
                 KeyCode::Char('o') | KeyCode::Char('O') => {
                     if let ViewState::Ports {
                         host_index,
@@ -563,9 +605,10 @@ fn draw_host_view(
         };
 
         for (row_idx, host) in scan.hosts.iter().enumerate() {
+            let ip_label = host.ip_display();
             let line = format!(
                 "| {:<ip_w$} | {:<ports_w$} | {:<services_w$} |\r\n",
-                &host.ip,
+                ip_label,
                 &host.ports_display,
                 &host.services_display,
                 ip_w = layout.ip_width,
@@ -607,7 +650,9 @@ fn draw_host_view(
 
     execute!(
         stdout,
-        Print("Use ↑/↓ or ←/→ to browse hosts, Enter to inspect, q or Esc to quit.\r\n")
+        Print(
+            "Use ↑/↓ or ←/→ to browse hosts, Enter to inspect, D to resolve hostnames, q or Esc to quit.\r\n"
+        )
     )?;
 
     if status.scan_complete {
@@ -639,7 +684,7 @@ fn draw_port_view(
         }
 
         let layout = compute_port_layout(host);
-        let title = format!(" {} ", host.ip);
+        let title = format!(" {} ", host.ip_display());
         let title_border = format!("+{}+\r\n", "-".repeat(title.len()));
         execute!(
             stdout,
@@ -776,7 +821,7 @@ fn compute_layout(scan: &ScanResults) -> TableLayout {
     let mut services_width = "Service".len();
 
     for host in &scan.hosts {
-        ip_width = ip_width.max(host.ip.len());
+        ip_width = ip_width.max(host.ip_display().len());
         ports_width = ports_width.max(host.ports_display.len());
         services_width = services_width.max(host.services_display.len());
     }
@@ -908,6 +953,7 @@ async fn scan_host_async(ip: Ipv4Addr, ports: &[u16]) -> Option<HostReport> {
     }
 
     let timeout_duration = Duration::from_millis(CONNECT_TIMEOUT_MS);
+    let hostname = reverse_dns_lookup(ip).await;
     let mut open_ports = Vec::new();
 
     for port in ports {
@@ -948,7 +994,7 @@ async fn scan_host_async(ip: Ipv4Addr, ports: &[u16]) -> Option<HostReport> {
     if open_ports.is_empty() {
         None
     } else {
-        Some(HostReport::new(ip, open_ports))
+        Some(HostReport::new(ip, hostname, open_ports))
     }
 }
 
@@ -960,6 +1006,29 @@ fn rescan_host_blocking(ip: Ipv4Addr) -> Result<Option<HostReport>, String> {
         .map_err(|err| err.to_string())?;
 
     Ok(runtime.block_on(scan_host_async(ip, &ports)))
+}
+
+async fn reverse_dns_lookup(ip: Ipv4Addr) -> Option<String> {
+    task::spawn_blocking(move || reverse_dns_lookup_inner(ip))
+        .await
+        .ok()
+        .flatten()
+}
+
+fn reverse_dns_lookup_inner(ip: Ipv4Addr) -> Option<String> {
+    lookup_addr(&IpAddr::V4(ip))
+        .ok()
+        .and_then(|raw| sanitize_hostname(raw.as_str()))
+}
+
+fn resolve_hostnames_blocking(ips: &[Ipv4Addr]) -> HashMap<Ipv4Addr, String> {
+    let mut resolved = HashMap::new();
+    for ip in ips {
+        if let Some(name) = reverse_dns_lookup_inner(*ip) {
+            resolved.insert(*ip, name);
+        }
+    }
+    resolved
 }
 
 // Best-effort fingerprint detection; runs inside spawn_blocking so scans keep progressing.
@@ -1074,6 +1143,51 @@ fn tidy_fingerprint(raw: &str) -> Option<String> {
     Some(result)
 }
 
+fn sanitize_hostname(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let trimmed = trimmed.trim_end_matches('.').trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut cleaned = String::with_capacity(trimmed.len());
+    let mut last_was_space = false;
+    for ch in trimmed.chars() {
+        if ch.is_control() {
+            continue;
+        }
+
+        if ch.is_whitespace() {
+            if !last_was_space {
+                cleaned.push(' ');
+                last_was_space = true;
+            }
+            continue;
+        }
+
+        cleaned.push(ch);
+        last_was_space = false;
+    }
+
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        return None;
+    }
+
+    let mut normalized = cleaned.to_string();
+    normalized.make_ascii_lowercase();
+
+    if normalized.len() > MAX_HOSTNAME_LEN {
+        normalized.truncate(MAX_HOSTNAME_LEN);
+    }
+
+    Some(normalized)
+}
+
 fn extract_title(body: &str) -> Option<String> {
     let lower = body.to_lowercase();
     if let (Some(start), Some(end)) = (lower.find("<title"), lower.find("</title>")) {
@@ -1184,6 +1298,8 @@ struct ScanResults {
 struct HostReport {
     ip_addr: Ipv4Addr,
     ip: String,
+    hostname: Option<String>,
+    ip_display: String,
     ports: Vec<PortInfo>,
     ports_display: String,
     services_display: String,
@@ -1196,7 +1312,13 @@ impl ScanResults {
             .binary_search_by(|existing| existing.ip_addr.cmp(&host.ip_addr))
         {
             Ok(idx) => {
-                self.hosts[idx] = host;
+                let mut incoming = host;
+                if incoming.hostname().is_none() {
+                    if let Some(existing_name) = self.hosts[idx].hostname.clone() {
+                        incoming.set_hostname(Some(existing_name));
+                    }
+                }
+                self.hosts[idx] = incoming;
                 idx
             }
             Err(idx) => {
@@ -1208,7 +1330,7 @@ impl ScanResults {
 }
 
 impl HostReport {
-    fn new(ip: Ipv4Addr, ports: Vec<PortInfo>) -> Self {
+    fn new(ip: Ipv4Addr, hostname: Option<String>, ports: Vec<PortInfo>) -> Self {
         let ports_display = if ports.is_empty() {
             "-".to_string()
         } else {
@@ -1240,13 +1362,34 @@ impl HostReport {
             services.join(", ")
         };
 
-        HostReport {
+        let mut host = HostReport {
             ip_addr: ip,
             ip: ip.to_string(),
+            hostname: None,
+            ip_display: String::new(),
             ports,
             ports_display,
             services_display,
-        }
+        };
+
+        host.set_hostname(hostname);
+        host
+    }
+
+    fn hostname(&self) -> Option<&str> {
+        self.hostname.as_deref()
+    }
+
+    fn ip_display(&self) -> &str {
+        &self.ip_display
+    }
+
+    fn set_hostname(&mut self, hostname: Option<String>) {
+        self.hostname = hostname;
+        self.ip_display = match self.hostname.as_deref() {
+            Some(name) => format!("{} ({})", self.ip, name),
+            None => self.ip.clone(),
+        };
     }
 }
 

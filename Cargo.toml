@@ -16,3 +16,4 @@ tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "time"]
 futures = "0.3"
 open = "5"
 arboard = "3"
+dns-lookup = "2"

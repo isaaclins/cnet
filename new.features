@@ -32,7 +32,7 @@ Feature (DONE): Service fingerprinting
     Then the Ports View should display "nginx 1.25.3" instead of "HTTP"
     And the fingerprint data should be stored in the scan results
 
-Feature: Hostname and reverse DNS lookup
+Feature (DONE): Hostname and reverse DNS lookup
   As a user
   I want to see the DNS or mDNS hostname next to each IP
   So that I can identify devices more easily
