@@ -48,7 +48,7 @@ Feature (DONE): Hostname and reverse DNS lookup
     Then unresolved hosts should attempt reverse DNS lookup
     And the table should refresh with available hostnames
 
-Feature: Exporting scan results
+Feature (DONE): Exporting scan results
   As a user
   I want to export my scan results to files
   So that I can review or share them later

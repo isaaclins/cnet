@@ -1,10 +1,11 @@
 use dns_lookup::lookup_addr;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
 use std::io::{stdout, ErrorKind, Read, Stdout, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream as BlockingTcpStream};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     mpsc::{self, Receiver, TryRecvError},
@@ -527,6 +528,75 @@ fn run_app(
                         state_changed = true;
                     }
                 }
+                KeyCode::Char('m') | KeyCode::Char('M') => {
+                    if matches!(state, ViewState::Hosts { .. }) {
+                        if scan.hosts.is_empty() {
+                            status_message = Some("No hosts discovered yet.".to_string());
+                        } else {
+                            let ips: Vec<Ipv4Addr> = scan.hosts.iter().map(|host| host.ip_addr).collect();
+                            match resolve_mac_addresses_blocking(&ips) {
+                                Ok(resolved) => {
+                                    if resolved.is_empty() {
+                                        status_message = Some(
+                                            "No MAC addresses found. Try pinging the hosts first."
+                                                .to_string(),
+                                        );
+                                    } else {
+                                        let mut updated = 0usize;
+                                        for host in &mut scan.hosts {
+                                            if let Some(info) = resolved.get(&host.ip_addr) {
+                                                let mac_diff = match host.mac_address() {
+                                                    Some(existing) => {
+                                                        existing != info.mac.as_str()
+                                                    }
+                                                    None => true,
+                                                };
+
+                                                let vendor_diff = match (
+                                                    host.vendor(),
+                                                    info.vendor.as_deref(),
+                                                ) {
+                                                    (Some(existing), Some(candidate)) => {
+                                                        existing != candidate
+                                                    }
+                                                    (Some(_), None) => false,
+                                                    (None, Some(_)) => true,
+                                                    (None, None) => false,
+                                                };
+
+                                                if mac_diff || vendor_diff {
+                                                    host.set_mac_info(
+                                                        Some(info.mac.clone()),
+                                                        info.vendor.clone(),
+                                                    );
+                                                    updated += 1;
+                                                }
+                                            }
+                                        }
+
+                                        if updated == 0 {
+                                            status_message = Some(
+                                                "MAC addresses already resolved.".to_string(),
+                                            );
+                                        } else {
+                                            let plural = if updated == 1 { "" } else { "es" };
+                                            status_message = Some(format!(
+                                                "Resolved {updated} MAC address{plural}."
+                                            ));
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    status_message = Some(format!(
+                                        "MAC lookup failed: {err}"
+                                    ));
+                                }
+                            }
+                        }
+                        force_draw = true;
+                        state_changed = true;
+                    }
+                }
                 KeyCode::Char('e') | KeyCode::Char('E') => {
                     if matches!(export_mode, ExportMode::ChoosingFormat) {
                         continue;
@@ -720,17 +790,23 @@ fn draw_host_view(
         execute!(stdout, Print("\r\n"))?;
     } else {
         let border = format!(
-            "+{}+{}+{}+\r\n",
+            "+{}+{}+{}+{}+{}+\r\n",
             "-".repeat(layout.ip_width + 2),
+            "-".repeat(layout.mac_width + 2),
+            "-".repeat(layout.vendor_width + 2),
             "-".repeat(layout.ports_width + 2),
             "-".repeat(layout.services_width + 2)
         );
         let header = format!(
-            "| {:^ip_w$} | {:^ports_w$} | {:^services_w$} |\r\n",
+            "| {:^ip_w$} | {:^mac_w$} | {:^vendor_w$} | {:^ports_w$} | {:^services_w$} |\r\n",
             "IP Address",
+            "MAC Address",
+            "Vendor",
             "Open Ports",
             "Service",
             ip_w = layout.ip_width,
+            mac_w = layout.mac_width,
+            vendor_w = layout.vendor_width,
             ports_w = layout.ports_width,
             services_w = layout.services_width
         );
@@ -751,11 +827,15 @@ fn draw_host_view(
         for (row_idx, host) in scan.hosts.iter().enumerate() {
             let ip_label = host.ip_display();
             let line = format!(
-                "| {:<ip_w$} | {:<ports_w$} | {:<services_w$} |\r\n",
+                "| {:<ip_w$} | {:<mac_w$} | {:<vendor_w$} | {:<ports_w$} | {:<services_w$} |\r\n",
                 ip_label,
+                host.mac_display(),
+                host.vendor_display(),
                 &host.ports_display,
                 &host.services_display,
                 ip_w = layout.ip_width,
+                mac_w = layout.mac_width,
+                vendor_w = layout.vendor_width,
                 ports_w = layout.ports_width,
                 services_w = layout.services_width
             );
@@ -796,7 +876,7 @@ fn draw_host_view(
     execute!(
         stdout,
         Print(
-            "Use ↑/↓ or ←/→ to browse hosts, Enter to inspect, C to copy IP, D to resolve hostnames, E to export results, q or Esc to quit.\r\n"
+            "Use ↑/↓ or ←/→ to browse hosts, Enter to inspect, C to copy IP, D to resolve hostnames, M to resolve MAC/vendor, E to export results, q or Esc to quit.\r\n"
         )
     )?;
 
@@ -962,17 +1042,23 @@ fn compute_port_layout(host: &HostReport) -> PortTableLayout {
 
 fn compute_layout(scan: &ScanResults) -> TableLayout {
     let mut ip_width = "IP Address".len();
+    let mut mac_width = "MAC Address".len();
+    let mut vendor_width = "Vendor".len();
     let mut ports_width = "Open Ports".len();
     let mut services_width = "Service".len();
 
     for host in &scan.hosts {
         ip_width = ip_width.max(host.ip_display().len());
+        mac_width = mac_width.max(host.mac_display().len());
+        vendor_width = vendor_width.max(host.vendor_display().len());
         ports_width = ports_width.max(host.ports_display.len());
         services_width = services_width.max(host.services_display.len());
     }
 
     TableLayout {
         ip_width,
+        mac_width,
+        vendor_width,
         ports_width,
         services_width,
     }
@@ -1176,6 +1262,218 @@ fn resolve_hostnames_blocking(ips: &[Ipv4Addr]) -> HashMap<Ipv4Addr, String> {
     resolved
 }
 
+struct MacInfo {
+    mac: String,
+    vendor: Option<String>,
+}
+
+fn resolve_mac_addresses_blocking(
+    ips: &[Ipv4Addr],
+) -> Result<HashMap<Ipv4Addr, MacInfo>, String> {
+    if ips.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let targets: HashSet<Ipv4Addr> = ips.iter().copied().collect();
+    let entries = collect_arp_entries()?;
+    let mut resolved = HashMap::new();
+
+    for (ip, mac) in entries {
+        if !targets.contains(&ip) {
+            continue;
+        }
+
+        let vendor = lookup_vendor(&mac).map(|name| name.to_string());
+        resolved
+            .entry(ip)
+            .or_insert_with(|| MacInfo {
+                mac: mac.clone(),
+                vendor,
+            });
+    }
+
+    Ok(resolved)
+}
+
+fn collect_arp_entries() -> Result<Vec<(Ipv4Addr, String)>, String> {
+    if let Ok(output) = Command::new("arp").arg("-an").output() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let entries = parse_arp_output(&stdout);
+        if !entries.is_empty() {
+            return Ok(entries);
+        }
+    }
+
+    if let Ok(output) = Command::new("ip").arg("neigh").output() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let entries = parse_ip_neigh_output(&stdout);
+        if !entries.is_empty() {
+            return Ok(entries);
+        }
+    }
+
+    Ok(Vec::new())
+}
+
+fn parse_arp_output(output: &str) -> Vec<(Ipv4Addr, String)> {
+    let mut entries = Vec::new();
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let start = match trimmed.find('(') {
+            Some(idx) => idx,
+            None => continue,
+        };
+        let end = match trimmed[start + 1..].find(')') {
+            Some(idx) => start + 1 + idx,
+            None => continue,
+        };
+
+        let ip_str = &trimmed[start + 1..end];
+        let ip: Ipv4Addr = match ip_str.parse() {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+
+        let mac_start = match trimmed.find(" at ") {
+            Some(idx) => idx + 4,
+            None => continue,
+        };
+        let rest = &trimmed[mac_start..];
+        let mac_end = rest.find(' ').unwrap_or(rest.len());
+        let mac_raw = &rest[..mac_end];
+
+        if mac_raw.eq_ignore_ascii_case("(incomplete)") {
+            continue;
+        }
+
+        if let Some(mac) = normalize_mac(mac_raw) {
+            entries.push((ip, mac));
+        }
+    }
+
+    entries
+}
+
+fn parse_ip_neigh_output(output: &str) -> Vec<(Ipv4Addr, String)> {
+    let mut entries = Vec::new();
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let mut parts = trimmed.split_whitespace();
+        let ip_str = match parts.next() {
+            Some(value) => value,
+            None => continue,
+        };
+
+        let ip: Ipv4Addr = match ip_str.parse() {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+
+        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+        if let Some(pos) = tokens.iter().position(|token| *token == "lladdr") {
+            if let Some(mac_raw) = tokens.get(pos + 1) {
+                if let Some(mac) = normalize_mac(mac_raw) {
+                    entries.push((ip, mac));
+                }
+            }
+        }
+    }
+
+    entries
+}
+
+fn normalize_mac(mac: &str) -> Option<String> {
+    let mut hex = String::with_capacity(12);
+    for ch in mac.chars() {
+        if ch.is_ascii_hexdigit() {
+            hex.push(ch.to_ascii_uppercase());
+        }
+    }
+
+    if hex.len() != 12 {
+        return None;
+    }
+
+    let bytes = hex.into_bytes();
+    let mut formatted = String::with_capacity(17);
+    for idx in 0..6 {
+        if idx > 0 {
+            formatted.push(':');
+        }
+        formatted.push(bytes[idx * 2] as char);
+        formatted.push(bytes[idx * 2 + 1] as char);
+    }
+
+    Some(formatted)
+}
+
+fn lookup_vendor(mac: &str) -> Option<&'static str> {
+    let prefix: String = mac
+        .chars()
+        .filter(|ch| ch.is_ascii_hexdigit())
+        .map(|ch| ch.to_ascii_uppercase())
+        .take(6)
+        .collect();
+
+    if prefix.len() != 6 {
+        return None;
+    }
+
+    for (candidate, vendor) in VENDOR_PREFIXES {
+        if *candidate == prefix {
+            return Some(*vendor);
+        }
+    }
+
+    None
+}
+
+const VENDOR_PREFIXES: &[(&str, &str)] = &[
+    ("0017F2", "Apple"),
+    ("A45E60", "Apple"),
+    ("7C2EBD", "Apple"),
+    ("BC6778", "Apple"),
+    ("F0D1B8", "Amazon"),
+    ("38F23E", "Amazon"),
+    ("9027E4", "Amazon"),
+    ("F4F5E8", "TP-Link"),
+    ("14CF92", "TP-Link"),
+    ("A044D1", "TP-Link"),
+    ("00259C", "Cisco"),
+    ("000F66", "Cisco"),
+    ("3CB15B", "Cisco"),
+    ("24A43C", "Ubiquiti"),
+    ("249F89", "Ubiquiti"),
+    ("F09FC2", "Ubiquiti"),
+    ("B827EB", "Raspberry Pi"),
+    ("DC44B6", "Raspberry Pi"),
+    ("EC1A59", "Microsoft"),
+    ("BC33AC", "Microsoft"),
+    ("D4AE52", "Google"),
+    ("3C5AB4", "Google"),
+    ("18B430", "LG"),
+    ("CC61E5", "LG"),
+    ("A4CF12", "Samsung"),
+    ("D8B1CB", "Samsung"),
+    ("1C5CF2", "Samsung"),
+    ("C025E9", "Xiaomi"),
+    ("64D241", "Sonos"),
+    ("F81A67", "Sonos"),
+    ("F4C613", "Nest"),
+    ("F0B429", "Netgear"),
+    ("00146C", "Netgear"),
+];
+
 fn export_scan_results(scan: &ScanResults, format: ExportFormat) -> Result<PathBuf, String> {
     let export_dir = env::current_dir()
         .map_err(|err| err.to_string())?
@@ -1207,6 +1505,8 @@ struct JsonExportData {
 struct JsonExportHost {
     ip: String,
     hostname: Option<String>,
+    mac_address: Option<String>,
+    vendor: Option<String>,
     open_ports: Vec<u16>,
     services: Vec<String>,
     ports: Vec<JsonExportPort>,
@@ -1229,6 +1529,8 @@ fn export_to_json(scan: &ScanResults, path: &Path) -> Result<(), String> {
         .map(|host| JsonExportHost {
             ip: host.ip.clone(),
             hostname: host.hostname().map(|name| name.to_string()),
+            mac_address: host.mac_address().map(|value| value.to_string()),
+            vendor: host.vendor().map(|value| value.to_string()),
             open_ports: host.ports.iter().map(|p| p.port).collect(),
             services: collect_services(host),
             ports: host
@@ -1261,25 +1563,31 @@ fn export_to_json(scan: &ScanResults, path: &Path) -> Result<(), String> {
 
 fn export_to_csv(scan: &ScanResults, path: &Path) -> Result<(), String> {
     let mut rows = String::new();
-    rows.push_str("host_ip,hostname,port,service,fingerprint,url,public\n");
+    rows.push_str("host_ip,hostname,mac_address,vendor,port,service,fingerprint,url,public\n");
 
     if scan.hosts.is_empty() {
         rows.push_str("\n");
     } else {
         for host in &scan.hosts {
             let hostname = host.hostname().unwrap_or("");
+            let mac = host.mac_address().unwrap_or("");
+            let vendor = host.vendor().unwrap_or("");
             if host.ports.is_empty() {
                 rows.push_str(&format!(
-                    "{},{},,,,,\n",
+                    "{},{},{},{},,,,,\n",
                     csv_escape(&host.ip),
-                    csv_escape(hostname)
+                    csv_escape(hostname),
+                    csv_escape(mac),
+                    csv_escape(vendor)
                 ));
             } else {
                 for port in &host.ports {
                     rows.push_str(&format!(
-                        "{},{},{},{},{},{},{}\n",
+                        "{},{},{},{},{},{},{},{},{}\n",
                         csv_escape(&host.ip),
                         csv_escape(hostname),
+                        csv_escape(mac),
+                        csv_escape(vendor),
                         csv_escape(&port.port.to_string()),
                         csv_escape(&service_label(port)),
                         csv_escape(port.fingerprint.as_deref().unwrap_or("")),
@@ -1299,27 +1607,37 @@ fn export_to_markdown(scan: &ScanResults, path: &Path) -> Result<(), String> {
     doc.push_str("# cnet Scan Results\n\n");
     doc.push_str(&format!("*Local IP:* `{}`\n\n", scan.local_ip));
 
-    doc.push_str("| IP Address | Hostname | Open Ports | Services |\n");
-    doc.push_str("| --- | --- | --- | --- |\n");
+    doc.push_str("| IP Address | Hostname | MAC Address | Vendor | Open Ports | Services |\n");
+    doc.push_str("| --- | --- | --- | --- | --- | --- |\n");
 
     for host in &scan.hosts {
         let hostname = host.hostname().unwrap_or("-");
         doc.push_str(&format!(
-            "| {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} |\n",
             markdown_escape(&host.ip_display()),
             markdown_escape(hostname),
+            markdown_escape(host.mac_display()),
+            markdown_escape(host.vendor_display()),
             markdown_escape(&host.ports_display),
             markdown_escape(&host.services_display)
         ));
     }
 
     if scan.hosts.is_empty() {
-        doc.push_str("| *(none)* | | | |\n");
+        doc.push_str("| *(none)* | | | | | |\n");
     }
 
     for host in &scan.hosts {
         doc.push_str("\n");
         doc.push_str(&format!("### {}\n\n", markdown_escape(host.ip_display())));
+        doc.push_str(&format!(
+            "*MAC Address:* `{}`  \n",
+            markdown_escape(host.mac_display())
+        ));
+        doc.push_str(&format!(
+            "*Vendor:* `{}`  \n\n",
+            markdown_escape(host.vendor_display())
+        ));
         doc.push_str("| Port | Service | Fingerprint | URL | Public |\n");
         doc.push_str("| --- | --- | --- | --- | --- |\n");
 
@@ -1658,6 +1976,10 @@ struct HostReport {
     ip: String,
     hostname: Option<String>,
     ip_display: String,
+    mac: Option<String>,
+    mac_display: String,
+    vendor: Option<String>,
+    vendor_display: String,
     ports: Vec<PortInfo>,
     ports_display: String,
     services_display: String,
@@ -1675,6 +1997,11 @@ impl ScanResults {
                     if let Some(existing_name) = self.hosts[idx].hostname.clone() {
                         incoming.set_hostname(Some(existing_name));
                     }
+                }
+                if incoming.mac_address().is_none() {
+                    let existing_mac = self.hosts[idx].mac.clone();
+                    let existing_vendor = self.hosts[idx].vendor.clone();
+                    incoming.set_mac_info(existing_mac, existing_vendor);
                 }
                 self.hosts[idx] = incoming;
                 idx
@@ -1725,6 +2052,10 @@ impl HostReport {
             ip: ip.to_string(),
             hostname: None,
             ip_display: String::new(),
+            mac: None,
+            mac_display: String::from("-"),
+            vendor: None,
+            vendor_display: String::from("-"),
             ports,
             ports_display,
             services_display,
@@ -1748,6 +2079,37 @@ impl HostReport {
             Some(name) => format!("{} ({})", self.ip, name),
             None => self.ip.clone(),
         };
+    }
+
+    fn mac_address(&self) -> Option<&str> {
+        self.mac.as_deref()
+    }
+
+    fn mac_display(&self) -> &str {
+        &self.mac_display
+    }
+
+    fn vendor(&self) -> Option<&str> {
+        self.vendor.as_deref()
+    }
+
+    fn vendor_display(&self) -> &str {
+        &self.vendor_display
+    }
+
+    fn set_mac_info(&mut self, mac: Option<String>, vendor: Option<String>) {
+        self.mac = mac;
+        self.vendor = vendor;
+        self.mac_display = self
+            .mac
+            .as_deref()
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        self.vendor_display = self
+            .vendor
+            .as_deref()
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string());
     }
 }
 
@@ -1789,6 +2151,8 @@ impl PortInfo {
 
 struct TableLayout {
     ip_width: usize,
+    mac_width: usize,
+    vendor_width: usize,
     ports_width: usize,
     services_width: usize,
 }
