@@ -1,4 +1,4 @@
-Feature: Keyboard shortcuts for host and port actions
+Feature (DONE): Keyboard shortcuts for host and port actions
   As a user
   I want to use keyboard shortcuts
   So that I can quickly interact with hosts and ports in the TUI
@@ -22,7 +22,7 @@ Feature: Keyboard shortcuts for host and port actions
     When the user presses "C" (or equivalent key in the settings)
     Then the clipboard should contain "192.168.1.1:443"
 
-Feature: Service fingerprinting
+Feature (DONE): Service fingerprinting
   As a user
   I want to identify what software and versions are running on each open port
   So that I can understand my network’s services more precisely

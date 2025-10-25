@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{stdout, ErrorKind, Stdout, Write};
+use std::io::{stdout, ErrorKind, Read, Stdout, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream as BlockingTcpStream};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -21,11 +21,12 @@ use futures::stream::{self, StreamExt};
 use get_if_addrs::{get_if_addrs, IfAddr};
 use ipnetwork::Ipv4Network;
 use reqwest::blocking::Client;
-use reqwest::header::ACCEPT;
+use reqwest::header::{ACCEPT, SERVER};
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream as AsyncTcpStream;
 use tokio::runtime::Builder;
+use tokio::task;
 use tokio::time::timeout;
 
 const CONNECT_TIMEOUT_MS: u64 = 200;
@@ -34,6 +35,7 @@ const MIN_PREFIX: u8 = 24;
 const MAX_HOSTS_TO_SCAN: usize = 512;
 const HOST_CONCURRENCY: usize = 64;
 const PROBE_PORTS: &[u16] = &[1, 22, 80];
+const MAX_FINGERPRINT_LEN: usize = 80;
 
 #[derive(Clone, Copy)]
 struct Selection {
@@ -106,9 +108,16 @@ fn main() -> std::io::Result<()> {
         Ok(Some(selection)) => {
             if let Some(host) = scan_results.hosts.get(selection.host_index) {
                 if let Some(port) = host.ports.get(selection.port_index) {
+                    let service_label = port
+                        .fingerprint
+                        .as_deref()
+                        .unwrap_or_else(|| port.service.unwrap_or("unknown service"));
                     println!("Host: {}", host.ip);
                     println!("Port: {}", port.port);
-                    println!("Service: {}", port.service.unwrap_or("unknown service"));
+                    println!("Service: {}", service_label);
+                    if let Some(fingerprint) = &port.fingerprint {
+                        println!("Fingerprint: {fingerprint}");
+                    }
                     println!("URL: {}", port.url_display);
                     match &port.public_status {
                         PublicStatus::Accessible {
@@ -680,7 +689,10 @@ fn draw_port_view(
         };
 
         for (row_idx, port) in host.ports.iter().enumerate() {
-            let label = port.service.unwrap_or("unknown");
+            let label = port
+                .fingerprint
+                .as_deref()
+                .unwrap_or_else(|| port.service.unwrap_or("unknown"));
             let line = format!(
                 "| {:>port_w$} | {:<service_w$} | {:<url_w$} | {:<public_w$} |\r\n",
                 port.port,
@@ -741,7 +753,10 @@ fn compute_port_layout(host: &HostReport) -> PortTableLayout {
 
     for port in &host.ports {
         port_width = port_width.max(port.port.to_string().len());
-        let label = port.service.unwrap_or("unknown");
+        let label = port
+            .fingerprint
+            .as_deref()
+            .unwrap_or_else(|| port.service.unwrap_or("unknown"));
         service_width = service_width.max(label.len());
         url_width = url_width.max(port.url_display.len());
         public_width = public_width.max(port.public_label.len());
@@ -903,9 +918,11 @@ async fn scan_host_async(ip: Ipv4Addr, ports: &[u16]) -> Option<HostReport> {
                 let service = port_service(*port);
                 let url = port_url(ip, *port, service);
                 let url_display = url.clone().unwrap_or_else(|| "(unknown)".to_string());
+                let fingerprint = fingerprint_service(ip, *port, service).await;
                 open_ports.push(PortInfo {
                     port: *port,
                     service,
+                    fingerprint,
                     url,
                     url_display,
                     public_status: PublicStatus::Unknown,
@@ -943,6 +960,128 @@ fn rescan_host_blocking(ip: Ipv4Addr) -> Result<Option<HostReport>, String> {
         .map_err(|err| err.to_string())?;
 
     Ok(runtime.block_on(scan_host_async(ip, &ports)))
+}
+
+// Best-effort fingerprint detection; runs inside spawn_blocking so scans keep progressing.
+async fn fingerprint_service(
+    ip: Ipv4Addr,
+    port: u16,
+    service: Option<&'static str>,
+) -> Option<String> {
+    let service_hint = service;
+    task::spawn_blocking(move || match service_hint {
+        Some("HTTPS") => fingerprint_http_blocking(ip, port, true)
+            .or_else(|| fingerprint_http_blocking(ip, port, false))
+            .or_else(|| banner_grab_blocking(ip, port)),
+        Some("HTTP")
+        | Some("Proxy")
+        | Some("Prometheus")
+        | Some("Elasticsearch")
+        | Some("SonarQube") => {
+            fingerprint_http_blocking(ip, port, false).or_else(|| banner_grab_blocking(ip, port))
+        }
+        Some("SSH") | Some("FTP") | Some("SMTP") | Some("SMTPS") | Some("Telnet") => {
+            banner_grab_blocking(ip, port)
+        }
+        _ => banner_grab_blocking(ip, port),
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+fn fingerprint_http_blocking(ip: Ipv4Addr, port: u16, use_https: bool) -> Option<String> {
+    let scheme = if use_https { "https" } else { "http" };
+    let url = format!("{scheme}://{ip}:{port}/");
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(800))
+        .danger_accept_invalid_certs(true)
+        .build()
+        .ok()?;
+    let response = client.get(url).header(ACCEPT, "*/*").send().ok()?;
+
+    if let Some(server) = response
+        .headers()
+        .get(SERVER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(tidy_fingerprint)
+    {
+        return Some(server);
+    }
+
+    if let Some(powered_by) = response
+        .headers()
+        .get("x-powered-by")
+        .and_then(|value| value.to_str().ok())
+        .and_then(tidy_fingerprint)
+    {
+        return Some(powered_by);
+    }
+
+    if let Ok(body) = response.text() {
+        if let Some(snippet) = extract_title(&body) {
+            return Some(snippet);
+        }
+    }
+
+    None
+}
+
+fn banner_grab_blocking(ip: Ipv4Addr, port: u16) -> Option<String> {
+    let addr = SocketAddr::new(IpAddr::V4(ip), port);
+    let mut stream = BlockingTcpStream::connect_timeout(&addr, Duration::from_millis(600)).ok()?;
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(600)));
+    let mut buffer = [0u8; 256];
+    let size = stream.read(&mut buffer).ok()?;
+    if size == 0 {
+        return None;
+    }
+
+    let text = String::from_utf8_lossy(&buffer[..size]);
+    tidy_fingerprint(text.lines().next().unwrap_or_default())
+}
+
+fn tidy_fingerprint(raw: &str) -> Option<String> {
+    let trimmed = raw.trim_matches(|c: char| c.is_control()).trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut cleaned = String::with_capacity(trimmed.len());
+    let mut last_was_space = false;
+    for ch in trimmed.chars() {
+        if ch.is_control() {
+            if !last_was_space {
+                cleaned.push(' ');
+                last_was_space = true;
+            }
+            continue;
+        }
+        cleaned.push(ch);
+        last_was_space = ch.is_whitespace();
+    }
+
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        return None;
+    }
+
+    let mut result = cleaned.to_string();
+    if result.len() > MAX_FINGERPRINT_LEN {
+        result.truncate(MAX_FINGERPRINT_LEN);
+    }
+
+    Some(result)
+}
+
+fn extract_title(body: &str) -> Option<String> {
+    let lower = body.to_lowercase();
+    if let (Some(start), Some(end)) = (lower.find("<title"), lower.find("</title>")) {
+        let title_start = body[start..].find('>').map(|idx| start + idx + 1)?;
+        let raw_title = body[title_start..end].trim();
+        return tidy_fingerprint(raw_title);
+    }
+    None
 }
 
 fn default_port_list() -> Vec<u16> {
@@ -1080,11 +1219,18 @@ impl HostReport {
                 .join(", ")
         };
 
-        let mut services = Vec::new();
+        let mut services: Vec<String> = Vec::new();
         for entry in &ports {
+            if let Some(fingerprint) = entry.fingerprint.as_ref() {
+                if !services.iter().any(|existing| existing == fingerprint) {
+                    services.push(fingerprint.clone());
+                }
+                continue;
+            }
+
             if let Some(name) = entry.service {
-                if !services.iter().any(|existing| *existing == name) {
-                    services.push(name);
+                if !services.iter().any(|existing| existing == name) {
+                    services.push(name.to_string());
                 }
             }
         }
@@ -1107,6 +1253,7 @@ impl HostReport {
 struct PortInfo {
     port: u16,
     service: Option<&'static str>,
+    fingerprint: Option<String>,
     url: Option<String>,
     url_display: String,
     public_status: PublicStatus,
