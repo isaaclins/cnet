@@ -461,12 +461,42 @@ fn run_app(
                         force_draw = true;
                     }
                 }
-                KeyCode::Char('c') | KeyCode::Char('C') => {
-                    if let ViewState::Ports {
+                KeyCode::Char('c') | KeyCode::Char('C') => match &state {
+                    ViewState::Hosts { selected } => {
+                        if scan.hosts.is_empty() {
+                            status_message = Some("No hosts available to copy.".to_string());
+                        } else {
+                            let host_index = (*selected).min(scan.hosts.len() - 1);
+                            if let Some(host) = scan.hosts.get(host_index) {
+                                let clip_text = host.ip.clone();
+                                match Clipboard::new() {
+                                    Ok(mut clipboard) => {
+                                        match clipboard.set_text(clip_text.clone()) {
+                                            Ok(()) => {
+                                                status_message = Some(format!(
+                                                    "Copied {} to clipboard",
+                                                    clip_text
+                                                ));
+                                            }
+                                            Err(err) => {
+                                                status_message =
+                                                    Some(format!("Clipboard error: {}", err));
+                                            }
+                                        }
+                                    }
+                                    Err(err) => {
+                                        status_message =
+                                            Some(format!("Clipboard unavailable: {}", err));
+                                    }
+                                }
+                            }
+                        }
+                        force_draw = true;
+                    }
+                    ViewState::Ports {
                         host_index,
                         port_index,
-                    } = &state
-                    {
+                    } => {
                         if let Some(host) = scan.hosts.get(*host_index) {
                             if let Some(port) = host.ports.get(*port_index) {
                                 let clip_text = format!("{}:{}", host.ip, port.port);
@@ -494,7 +524,7 @@ fn run_app(
                         }
                         force_draw = true;
                     }
-                }
+                },
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(None),
                 _ => {}
             },
@@ -629,6 +659,7 @@ fn draw_host_view(
             }
         }
 
+        execute!(stdout, Print(border.clone()))?;
         execute!(stdout, Print("\r\n"))?;
     }
 
@@ -651,7 +682,7 @@ fn draw_host_view(
     execute!(
         stdout,
         Print(
-            "Use ↑/↓ or ←/→ to browse hosts, Enter to inspect, D to resolve hostnames, q or Esc to quit.\r\n"
+            "Use ↑/↓ or ←/→ to browse hosts, Enter to inspect, C to copy IP, D to resolve hostnames, q or Esc to quit.\r\n"
         )
     )?;
 
@@ -768,7 +799,7 @@ fn draw_port_view(
         execute!(
             stdout,
             Print(
-                "\r\nUse ↑/↓ to browse ports, Enter to finish, ← or Backspace to return, q or Esc to quit.\r\n"
+                "\r\nUse ↑/↓ to browse ports, Enter to finish, ← or Backspace to return, C to copy host:port, q or Esc to quit.\r\n"
             )
         )?;
 
