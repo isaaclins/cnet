@@ -1,7 +1,11 @@
 use std::collections::HashMap;
 use std::io::{stdout, ErrorKind, Stdout, Write};
-use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream as BlockingTcpStream};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    mpsc::{self, Receiver, TryRecvError},
+    Arc,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -12,16 +16,22 @@ use crossterm::{
     style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor},
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use futures::stream::{self, StreamExt};
 use get_if_addrs::{get_if_addrs, IfAddr};
 use ipnetwork::Ipv4Network;
 use reqwest::blocking::Client;
 use reqwest::header::ACCEPT;
 use serde::Deserialize;
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream as AsyncTcpStream;
+use tokio::runtime::Builder;
+use tokio::time::timeout;
 
 const CONNECT_TIMEOUT_MS: u64 = 200;
 const PROBE_TIMEOUT_MS: u64 = 60;
 const MIN_PREFIX: u8 = 24;
 const MAX_HOSTS_TO_SCAN: usize = 512;
+const HOST_CONCURRENCY: usize = 64;
 const PROBE_PORTS: &[u16] = &[1, 22, 80];
 
 #[derive(Clone, Copy)]
@@ -674,24 +684,46 @@ fn start_scan() -> Result<(ScanResults, Receiver<ScanMessage>), String> {
         .collect();
     let hosts_planned = host_ips.len();
 
-    let ports = default_port_list();
-
     let (tx, rx) = mpsc::channel();
-    let thread_ports = ports.clone();
-
     thread::spawn(move || {
-        for (index, ip) in host_ips.into_iter().enumerate() {
-            let processed = index + 1;
-            let report = scan_host(ip, &thread_ports);
-            if tx
-                .send(ScanMessage::HostProgress { processed, report })
-                .is_err()
-            {
+        let runtime = match Builder::new_multi_thread()
+            .enable_all()
+            .thread_name("cnet-scanner")
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(err) => {
+                eprintln!("Failed to build async runtime: {err}");
+                let _ = tx.send(ScanMessage::Finished);
                 return;
             }
-        }
+        };
 
-        let _ = tx.send(ScanMessage::Finished);
+        let ports = Arc::new(default_port_list());
+        let processed = Arc::new(AtomicUsize::new(0));
+
+        runtime.block_on(async move {
+            let sender = tx.clone();
+
+            stream::iter(host_ips.into_iter())
+                .for_each_concurrent(Some(HOST_CONCURRENCY), {
+                    let ports = Arc::clone(&ports);
+                    let processed = Arc::clone(&processed);
+                    move |ip| {
+                        let tx = sender.clone();
+                        let ports = Arc::clone(&ports);
+                        let processed = Arc::clone(&processed);
+                        async move {
+                            let report = scan_host_async(ip, ports.as_slice()).await;
+                            let processed = processed.fetch_add(1, Ordering::Relaxed) + 1;
+                            let _ = tx.send(ScanMessage::HostProgress { processed, report });
+                        }
+                    }
+                })
+                .await;
+
+            let _ = tx.send(ScanMessage::Finished);
+        });
     });
 
     let scan_results = ScanResults {
@@ -705,17 +737,17 @@ fn start_scan() -> Result<(ScanResults, Receiver<ScanMessage>), String> {
     Ok((scan_results, rx))
 }
 
-fn host_is_reachable(ip: Ipv4Addr) -> bool {
-    let timeout = Duration::from_millis(PROBE_TIMEOUT_MS);
+async fn host_is_reachable_async(ip: Ipv4Addr) -> bool {
+    let timeout_duration = Duration::from_millis(PROBE_TIMEOUT_MS);
 
     for port in PROBE_PORTS {
         let addr = SocketAddr::new(IpAddr::V4(ip), *port);
-        match TcpStream::connect_timeout(&addr, timeout) {
-            Ok(stream) => {
-                let _ = stream.shutdown(Shutdown::Both);
+        match timeout(timeout_duration, AsyncTcpStream::connect(addr)).await {
+            Ok(Ok(mut stream)) => {
+                let _ = stream.shutdown().await;
                 return true;
             }
-            Err(err) => match err.kind() {
+            Ok(Err(err)) => match err.kind() {
                 ErrorKind::ConnectionRefused
                 | ErrorKind::ConnectionReset
                 | ErrorKind::ConnectionAborted
@@ -725,25 +757,26 @@ fn host_is_reachable(ip: Ipv4Addr) -> bool {
                 ErrorKind::TimedOut | ErrorKind::WouldBlock => {}
                 _ => {}
             },
+            Err(_) => {}
         }
     }
 
     false
 }
 
-fn scan_host(ip: Ipv4Addr, ports: &[u16]) -> Option<HostReport> {
-    if !host_is_reachable(ip) {
+async fn scan_host_async(ip: Ipv4Addr, ports: &[u16]) -> Option<HostReport> {
+    if !host_is_reachable_async(ip).await {
         return None;
     }
 
-    let timeout = Duration::from_millis(CONNECT_TIMEOUT_MS);
+    let timeout_duration = Duration::from_millis(CONNECT_TIMEOUT_MS);
     let mut open_ports = Vec::new();
 
     for port in ports {
         let addr = SocketAddr::new(IpAddr::V4(ip), *port);
-        match TcpStream::connect_timeout(&addr, timeout) {
-            Ok(stream) => {
-                let _ = stream.shutdown(Shutdown::Both);
+        match timeout(timeout_duration, AsyncTcpStream::connect(addr)).await {
+            Ok(Ok(mut stream)) => {
+                let _ = stream.shutdown().await;
                 let service = port_service(*port);
                 let url = port_url(ip, *port, service);
                 let url_display = url
@@ -758,7 +791,7 @@ fn scan_host(ip: Ipv4Addr, ports: &[u16]) -> Option<HostReport> {
                     public_label: String::from("pending"),
                 });
             }
-            Err(err) => {
+            Ok(Err(err)) => {
                 if matches!(
                     err.kind(),
                     ErrorKind::ConnectionRefused
@@ -770,6 +803,7 @@ fn scan_host(ip: Ipv4Addr, ports: &[u16]) -> Option<HostReport> {
                     // Port closed or filtered, ignore.
                 }
             }
+            Err(_) => {}
         }
     }
 
@@ -1062,7 +1096,7 @@ impl PublicAccessChecker {
 
     fn probe_public_host(&self, host: Ipv4Addr, port: u16) -> PublicStatus {
         let addr = SocketAddr::new(IpAddr::V4(host), port);
-        match TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
+        match BlockingTcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
             Ok(stream) => {
                 let _ = stream.shutdown(Shutdown::Both);
                 PublicStatus::Accessible {
