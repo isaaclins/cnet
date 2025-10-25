@@ -369,45 +369,31 @@ fn draw_host_view(
 ) -> std::io::Result<()> {
     let layout = compute_layout(scan);
 
-    execute!(
-        stdout,
-        Print(format!("Network Scan Results\r\n{}\r\n", "=".repeat(23))),
-        Print(format!("Subnet: {}\r\n", scan.network)),
-        Print(format!(
-            "Local IP: {} | Hosts probed: {} / {} | Hosts with open ports: {}\r\n",
-            scan.local_ip,
-            scan.hosts_considered,
-            scan.hosts_planned,
-            scan.hosts.len()
-        )),
-        Print(format!(
-            "Ports tested ({}): {}\r\n",
-            scan.ports_checked, scan.ports_display
-        )),
-    )?;
-
-    if scan.hosts_planned < scan.hosts_available {
-        execute!(
-            stdout,
-            Print(format!(
-                "Note: scan limited to first {} of {} hosts. Adjust MAX_HOSTS_TO_SCAN to widen coverage.\r\n",
-                scan.hosts_planned, scan.hosts_available
-            ))
-        )?;
-    }
-
     if let Some(text) = status.spinner_text {
         execute!(stdout, Print(format!("{}\r\n", text)))?;
+    } else if status.scan_complete {
+        execute!(stdout, Print("Scan complete\r\n"))?;
     }
 
-    execute!(stdout, Print("\r\n"))?;
+    execute!(
+        stdout,
+        Print(format!("Local IP: {}\r\n", scan.local_ip)),
+        Print(format!(
+            "Hosts probed: {} / {}\r\n",
+            scan.hosts_considered, scan.hosts_planned
+        )),
+        Print(format!("Hosts with open ports: {}\r\n", scan.hosts.len())),
+        Print("\r\n"),
+    )?;
 
     if scan.hosts.is_empty() {
-        execute!(
-            stdout,
-            Print("No hosts with open ports were discovered.\r\n"),
-            Print("Press q or Esc to exit.\r\n")
-        )?;
+        if status.scan_complete {
+            execute!(
+                stdout,
+                Print("No hosts with open ports were discovered.\r\n")
+            )?;
+        }
+        execute!(stdout, Print("\r\n"))?;
     } else {
         let border = format!(
             "+{}+{}+{}+\r\n",
@@ -462,12 +448,28 @@ fn draw_host_view(
             }
         }
 
-        execute!(stdout, Print(border))?;
+        execute!(stdout, Print("\r\n"))?;
     }
+
+    let total_segments = 40usize;
+    let planned = scan.hosts_planned.max(1);
+    let completed_segments = if status.scan_complete {
+        total_segments
+    } else if scan.hosts_planned == 0 {
+        0
+    } else {
+        ((scan.hosts_considered.min(planned) * total_segments) / planned).min(total_segments)
+    };
+    let bar = format!(
+        "[{}{}]",
+        "=".repeat(completed_segments),
+        "-".repeat(total_segments.saturating_sub(completed_segments))
+    );
+    execute!(stdout, Print(format!("{}\r\n\r\n", bar)))?;
 
     execute!(
         stdout,
-        Print("\r\nUse ↑/↓ or ←/→ to browse hosts, Enter to inspect, q or Esc to quit.\r\n")
+        Print("Use ↑/↓ or ←/→ to browse hosts, Enter to inspect, q or Esc to quit.\r\n")
     )?;
 
     if status.scan_complete {
@@ -665,7 +667,6 @@ fn start_scan() -> Result<(ScanResults, Receiver<ScanMessage>), String> {
 
     let network_addr = effective_network.network();
     let broadcast_addr = effective_network.broadcast();
-    let hosts_available = effective_network.size().saturating_sub(2) as usize;
     let host_ips: Vec<Ipv4Addr> = effective_network
         .iter()
         .filter(|ip| *ip != network_addr && *ip != broadcast_addr && *ip != v4.ip)
@@ -674,11 +675,6 @@ fn start_scan() -> Result<(ScanResults, Receiver<ScanMessage>), String> {
     let hosts_planned = host_ips.len();
 
     let ports = default_port_list();
-    let ports_display = ports
-        .iter()
-        .map(|port| port.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
 
     let (tx, rx) = mpsc::channel();
     let thread_ports = ports.clone();
@@ -701,11 +697,7 @@ fn start_scan() -> Result<(ScanResults, Receiver<ScanMessage>), String> {
     let scan_results = ScanResults {
         hosts: Vec::new(),
         hosts_considered: 0,
-        hosts_available,
         hosts_planned,
-        ports_checked: ports.len(),
-        ports_display,
-        network: effective_network.to_string(),
         local_ip: v4.ip,
         scan_complete: false,
     };
@@ -880,11 +872,7 @@ fn network_address(ip: Ipv4Addr, prefix: u8) -> Ipv4Addr {
 struct ScanResults {
     hosts: Vec<HostReport>,
     hosts_considered: usize,
-    hosts_available: usize,
     hosts_planned: usize,
-    ports_checked: usize,
-    ports_display: String,
-    network: String,
     local_ip: Ipv4Addr,
     scan_complete: bool,
 }
