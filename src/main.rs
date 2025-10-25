@@ -1,7 +1,10 @@
 use dns_lookup::lookup_addr;
 use std::collections::HashMap;
+use std::env;
+use std::fs::{self, File};
 use std::io::{stdout, ErrorKind, Read, Stdout, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream as BlockingTcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     mpsc::{self, Receiver, TryRecvError},
@@ -23,7 +26,7 @@ use get_if_addrs::{get_if_addrs, IfAddr};
 use ipnetwork::Ipv4Network;
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, SERVER};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream as AsyncTcpStream;
 use tokio::runtime::Builder;
@@ -86,6 +89,29 @@ enum ScanMessage {
         report: Option<HostReport>,
     },
     Finished,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExportMode {
+    Normal,
+    ChoosingFormat,
+}
+
+#[derive(Clone, Copy)]
+enum ExportFormat {
+    Json,
+    Csv,
+    Markdown,
+}
+
+impl ExportFormat {
+    fn file_name(&self) -> &'static str {
+        match self {
+            ExportFormat::Json => "scan_results.json",
+            ExportFormat::Csv => "scan_results.csv",
+            ExportFormat::Markdown => "scan_results.md",
+        }
+    }
 }
 
 fn main() -> std::io::Result<()> {
@@ -175,6 +201,7 @@ fn run_app(
     let mut last_tick = Instant::now();
     let mut force_draw = true;
     let mut status_message: Option<String> = None;
+        let mut export_mode = ExportMode::Normal;
 
     drain_pending_events().map_err(|err| err.to_string())?;
 
@@ -229,6 +256,75 @@ fn run_app(
         let mut state_changed = false;
         match event::read() {
             Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Char('j') | KeyCode::Char('J')
+                    if matches!(export_mode, ExportMode::ChoosingFormat) =>
+                {
+                    export_mode = ExportMode::Normal;
+                    match export_scan_results(scan, ExportFormat::Json) {
+                        Ok(path) => {
+                            status_message = Some(format!(
+                                "Exported JSON to {}",
+                                human_display_path(&path)
+                            ));
+                        }
+                        Err(err) => {
+                            status_message = Some(format!(
+                                "JSON export failed: {}",
+                                err
+                            ));
+                        }
+                    }
+                    force_draw = true;
+                    continue;
+                }
+                KeyCode::Char('c') | KeyCode::Char('C')
+                    if matches!(export_mode, ExportMode::ChoosingFormat) =>
+                {
+                    export_mode = ExportMode::Normal;
+                    match export_scan_results(scan, ExportFormat::Csv) {
+                        Ok(path) => {
+                            status_message = Some(format!(
+                                "Exported CSV to {}",
+                                human_display_path(&path)
+                            ));
+                        }
+                        Err(err) => {
+                            status_message = Some(format!(
+                                "CSV export failed: {}",
+                                err
+                            ));
+                        }
+                    }
+                    force_draw = true;
+                    continue;
+                }
+                KeyCode::Char('m') | KeyCode::Char('M')
+                    if matches!(export_mode, ExportMode::ChoosingFormat) =>
+                {
+                    export_mode = ExportMode::Normal;
+                    match export_scan_results(scan, ExportFormat::Markdown) {
+                        Ok(path) => {
+                            status_message = Some(format!(
+                                "Exported Markdown to {}",
+                                human_display_path(&path)
+                            ));
+                        }
+                        Err(err) => {
+                            status_message = Some(format!(
+                                "Markdown export failed: {}",
+                                err
+                            ));
+                        }
+                    }
+                    force_draw = true;
+                    continue;
+                }
+                KeyCode::Esc if matches!(export_mode, ExportMode::ChoosingFormat) => {
+                    export_mode = ExportMode::Normal;
+                    status_message = Some("Export cancelled.".to_string());
+                    force_draw = true;
+                    continue;
+                }
                 KeyCode::Up => match &mut state {
                     ViewState::Hosts { selected } => {
                         if !scan.hosts.is_empty() {
@@ -430,6 +526,24 @@ fn run_app(
                         force_draw = true;
                         state_changed = true;
                     }
+                }
+                KeyCode::Char('e') | KeyCode::Char('E') => {
+                    if matches!(export_mode, ExportMode::ChoosingFormat) {
+                        continue;
+                    }
+
+                    if !scan.scan_complete {
+                        status_message = Some(
+                            "Scan still running; export after completion.".to_string(),
+                        );
+                    } else {
+                        export_mode = ExportMode::ChoosingFormat;
+                        status_message = Some(
+                            "Choose export format: [J] JSON, [C] CSV, [M] Markdown, Esc to cancel."
+                                .to_string(),
+                        );
+                    }
+                    force_draw = true;
                 }
                 KeyCode::Char('o') | KeyCode::Char('O') => {
                     if let ViewState::Ports {
@@ -682,7 +796,7 @@ fn draw_host_view(
     execute!(
         stdout,
         Print(
-            "Use ↑/↓ or ←/→ to browse hosts, Enter to inspect, C to copy IP, D to resolve hostnames, q or Esc to quit.\r\n"
+            "Use ↑/↓ or ←/→ to browse hosts, Enter to inspect, C to copy IP, D to resolve hostnames, E to export results, q or Esc to quit.\r\n"
         )
     )?;
 
@@ -799,7 +913,7 @@ fn draw_port_view(
         execute!(
             stdout,
             Print(
-                "\r\nUse ↑/↓ to browse ports, Enter to finish, ← or Backspace to return, C to copy host:port, q or Esc to quit.\r\n"
+                "\r\nUse ↑/↓ to browse ports, Enter to finish, ← or Backspace to return, C to copy host:port, E to export results, q or Esc to quit.\r\n"
             )
         )?;
 
@@ -1060,6 +1174,219 @@ fn resolve_hostnames_blocking(ips: &[Ipv4Addr]) -> HashMap<Ipv4Addr, String> {
         }
     }
     resolved
+}
+
+fn export_scan_results(scan: &ScanResults, format: ExportFormat) -> Result<PathBuf, String> {
+    let export_dir = env::current_dir()
+        .map_err(|err| err.to_string())?
+        .join("exports");
+    fs::create_dir_all(&export_dir)
+        .map_err(|err| format!("Failed to create export directory: {err}"))?;
+
+    let path = export_dir.join(format.file_name());
+
+    match format {
+        ExportFormat::Json => export_to_json(scan, &path)?,
+        ExportFormat::Csv => export_to_csv(scan, &path)?,
+        ExportFormat::Markdown => export_to_markdown(scan, &path)?,
+    }
+
+    Ok(path)
+}
+
+#[derive(Serialize)]
+struct JsonExportData {
+    local_ip: String,
+    hosts_considered: usize,
+    hosts_planned: usize,
+    scan_complete: bool,
+    hosts: Vec<JsonExportHost>,
+}
+
+#[derive(Serialize)]
+struct JsonExportHost {
+    ip: String,
+    hostname: Option<String>,
+    open_ports: Vec<u16>,
+    services: Vec<String>,
+    ports: Vec<JsonExportPort>,
+}
+
+#[derive(Serialize)]
+struct JsonExportPort {
+    port: u16,
+    service: Option<String>,
+    service_label: String,
+    fingerprint: Option<String>,
+    url: Option<String>,
+    public: String,
+}
+
+fn export_to_json(scan: &ScanResults, path: &Path) -> Result<(), String> {
+    let hosts = scan
+        .hosts
+        .iter()
+        .map(|host| JsonExportHost {
+            ip: host.ip.clone(),
+            hostname: host.hostname().map(|name| name.to_string()),
+            open_ports: host.ports.iter().map(|p| p.port).collect(),
+            services: collect_services(host),
+            ports: host
+                .ports
+                .iter()
+                .map(|port| JsonExportPort {
+                    port: port.port,
+                    service: port.service.map(|s| s.to_string()),
+                    service_label: service_label(port),
+                    fingerprint: port.fingerprint.clone(),
+                    url: port.url.clone(),
+                    public: port.public_label.clone(),
+                })
+                .collect(),
+        })
+        .collect();
+
+    let payload = JsonExportData {
+        local_ip: scan.local_ip.to_string(),
+        hosts_considered: scan.hosts_considered,
+        hosts_planned: scan.hosts_planned,
+        scan_complete: scan.scan_complete,
+        hosts,
+    };
+
+    let file = File::create(path).map_err(|err| format!("Failed to create JSON file: {err}"))?;
+    serde_json::to_writer_pretty(file, &payload)
+        .map_err(|err| format!("Failed to write JSON: {err}"))
+}
+
+fn export_to_csv(scan: &ScanResults, path: &Path) -> Result<(), String> {
+    let mut rows = String::new();
+    rows.push_str("host_ip,hostname,port,service,fingerprint,url,public\n");
+
+    if scan.hosts.is_empty() {
+        rows.push_str("\n");
+    } else {
+        for host in &scan.hosts {
+            let hostname = host.hostname().unwrap_or("");
+            if host.ports.is_empty() {
+                rows.push_str(&format!(
+                    "{},{},,,,,\n",
+                    csv_escape(&host.ip),
+                    csv_escape(hostname)
+                ));
+            } else {
+                for port in &host.ports {
+                    rows.push_str(&format!(
+                        "{},{},{},{},{},{},{}\n",
+                        csv_escape(&host.ip),
+                        csv_escape(hostname),
+                        csv_escape(&port.port.to_string()),
+                        csv_escape(&service_label(port)),
+                        csv_escape(port.fingerprint.as_deref().unwrap_or("")),
+                        csv_escape(port.url.as_deref().unwrap_or("")),
+                        csv_escape(&port.public_label)
+                    ));
+                }
+            }
+        }
+    }
+
+    fs::write(path, rows).map_err(|err| format!("Failed to write CSV: {err}"))
+}
+
+fn export_to_markdown(scan: &ScanResults, path: &Path) -> Result<(), String> {
+    let mut doc = String::new();
+    doc.push_str("# cnet Scan Results\n\n");
+    doc.push_str(&format!("*Local IP:* `{}`\n\n", scan.local_ip));
+
+    doc.push_str("| IP Address | Hostname | Open Ports | Services |\n");
+    doc.push_str("| --- | --- | --- | --- |\n");
+
+    for host in &scan.hosts {
+        let hostname = host.hostname().unwrap_or("-");
+        doc.push_str(&format!(
+            "| {} | {} | {} | {} |\n",
+            markdown_escape(&host.ip_display()),
+            markdown_escape(hostname),
+            markdown_escape(&host.ports_display),
+            markdown_escape(&host.services_display)
+        ));
+    }
+
+    if scan.hosts.is_empty() {
+        doc.push_str("| *(none)* | | | |\n");
+    }
+
+    for host in &scan.hosts {
+        doc.push_str("\n");
+        doc.push_str(&format!("### {}\n\n", markdown_escape(host.ip_display())));
+        doc.push_str("| Port | Service | Fingerprint | URL | Public |\n");
+        doc.push_str("| --- | --- | --- | --- | --- |\n");
+
+        if host.ports.is_empty() {
+            doc.push_str("| *(none)* | | | | |\n");
+        } else {
+            for port in &host.ports {
+                doc.push_str(&format!(
+                    "| {} | {} | {} | {} | {} |\n",
+                    port.port,
+                    markdown_escape(&service_label(port)),
+                    markdown_escape(port.fingerprint.as_deref().unwrap_or("")),
+                    markdown_escape(port.url.as_deref().unwrap_or("")),
+                    markdown_escape(&port.public_label)
+                ));
+            }
+        }
+    }
+
+    fs::write(path, doc).map_err(|err| format!("Failed to write Markdown: {err}"))
+}
+
+fn collect_services(host: &HostReport) -> Vec<String> {
+    let mut services = Vec::new();
+    for port in &host.ports {
+        if let Some(fingerprint) = port.fingerprint.as_ref() {
+            if !services.iter().any(|existing| existing == fingerprint) {
+                services.push(fingerprint.clone());
+            }
+            continue;
+        }
+
+        if let Some(name) = port.service {
+            let name_str = name.to_string();
+            if !services.iter().any(|existing| existing == &name_str) {
+                services.push(name_str);
+            }
+        }
+    }
+    services
+}
+
+fn service_label(port: &PortInfo) -> String {
+    port
+        .fingerprint
+        .clone()
+        .unwrap_or_else(|| port.service.unwrap_or("unknown").to_string())
+}
+
+fn csv_escape(value: &str) -> String {
+    let mut escaped = value.replace('"', "\"\"");
+    escaped = escaped.replace('\n', " ");
+    format!("\"{}\"", escaped)
+}
+
+fn markdown_escape(value: &str) -> String {
+    let escaped = value.replace('|', "\\|");
+    escaped.replace('\n', " ")
+}
+
+fn human_display_path(path: &Path) -> String {
+    if let Ok(current) = env::current_dir() {
+        if let Ok(relative) = path.strip_prefix(&current) {
+            return relative.display().to_string();
+        }
+    }
+    path.display().to_string()
 }
 
 // Best-effort fingerprint detection; runs inside spawn_blocking so scans keep progressing.
