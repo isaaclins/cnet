@@ -9,6 +9,7 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
+use arboard::Clipboard;
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{self, Event, KeyCode, KeyEventKind},
@@ -72,6 +73,7 @@ impl Spinner {
 struct UiStatus<'a> {
     spinner_text: Option<&'a str>,
     scan_complete: bool,
+    status_message: Option<&'a str>,
 }
 
 enum ScanMessage {
@@ -158,6 +160,7 @@ fn run_app(
     let spinner_interval = Duration::from_millis(400);
     let mut last_tick = Instant::now();
     let mut force_draw = true;
+    let mut status_message: Option<String> = None;
 
     drain_pending_events().map_err(|err| err.to_string())?;
 
@@ -169,7 +172,7 @@ fn run_app(
                 Ok(ScanMessage::HostProgress { processed, report }) => {
                     scan.hosts_considered = processed;
                     if let Some(host) = report {
-                        scan.insert_host(host);
+                        let _ = scan.insert_host(host);
                     }
                     needs_draw = true;
                 }
@@ -198,6 +201,7 @@ fn run_app(
             let status = UiStatus {
                 spinner_text: spinner_text.as_deref(),
                 scan_complete: scan.scan_complete,
+                status_message: status_message.as_deref(),
             };
             draw(stdout, &state, scan, &mut checker, &status).map_err(|err| err.to_string())?;
             force_draw = false;
@@ -329,6 +333,117 @@ fn run_app(
                         }));
                     }
                 },
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    if let ViewState::Hosts { selected } = &mut state {
+                        if scan.hosts.is_empty() {
+                            status_message = Some("No hosts available to rescan.".to_string());
+                        } else {
+                            let host_index = (*selected).min(scan.hosts.len() - 1);
+                            let host_ip = scan.hosts[host_index].ip_addr;
+                            let host_label = scan.hosts[host_index].ip.clone();
+                            match rescan_host_blocking(host_ip) {
+                                Ok(Some(report)) => {
+                                    let idx = scan.insert_host(report);
+                                    *selected = idx;
+                                    if let Some(updated) = scan.hosts.get(idx) {
+                                        let count = updated.ports.len();
+                                        let plural = if count == 1 { "" } else { "s" };
+                                        status_message = Some(format!(
+                                            "Rescan complete for {} ({} open port{})",
+                                            updated.ip, count, plural
+                                        ));
+                                    } else {
+                                        status_message =
+                                            Some(format!("Rescan complete for {}", host_label));
+                                    }
+                                }
+                                Ok(None) => {
+                                    let removed = scan.hosts.remove(host_index);
+                                    status_message = Some(format!(
+                                        "{} no longer has open ports; removed from list.",
+                                        removed.ip
+                                    ));
+                                    if scan.hosts.is_empty() {
+                                        *selected = 0;
+                                    } else {
+                                        let new_index = host_index.min(scan.hosts.len() - 1);
+                                        *selected = new_index;
+                                    }
+                                }
+                                Err(err) => {
+                                    status_message =
+                                        Some(format!("Rescan failed for {}: {}", host_label, err));
+                                }
+                            }
+                        }
+                        force_draw = true;
+                        state_changed = true;
+                    }
+                }
+                KeyCode::Char('o') | KeyCode::Char('O') => {
+                    if let ViewState::Ports {
+                        host_index,
+                        port_index,
+                    } = &state
+                    {
+                        if let Some(host) = scan.hosts.get(*host_index) {
+                            if let Some(port) = host.ports.get(*port_index) {
+                                if let Some(url) = port.url.as_ref() {
+                                    match open::that(url) {
+                                        Ok(_) => {
+                                            status_message =
+                                                Some(format!("Opened {} in browser", url));
+                                        }
+                                        Err(err) => {
+                                            status_message =
+                                                Some(format!("Failed to open {}: {}", url, err));
+                                        }
+                                    }
+                                } else {
+                                    status_message = Some(format!(
+                                        "No URL available for {} port {}",
+                                        host.ip, port.port
+                                    ));
+                                }
+                            }
+                        }
+                        force_draw = true;
+                    }
+                }
+                KeyCode::Char('c') | KeyCode::Char('C') => {
+                    if let ViewState::Ports {
+                        host_index,
+                        port_index,
+                    } = &state
+                    {
+                        if let Some(host) = scan.hosts.get(*host_index) {
+                            if let Some(port) = host.ports.get(*port_index) {
+                                let clip_text = format!("{}:{}", host.ip, port.port);
+                                match Clipboard::new() {
+                                    Ok(mut clipboard) => {
+                                        match clipboard.set_text(clip_text.clone()) {
+                                            Ok(()) => {
+                                                status_message = Some(format!(
+                                                    "Copied {} to clipboard",
+                                                    clip_text
+                                                ));
+                                            }
+                                            Err(err) => {
+                                                status_message =
+                                                    Some(format!("Clipboard error: {}", err));
+                                            }
+                                        }
+                                    }
+                                    Err(err) => {
+                                        status_message =
+                                            Some(format!("Clipboard unavailable: {}", err));
+                                    }
+                                }
+                            }
+                        }
+                        force_draw = true;
+                    }
+                }
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(None),
                 _ => {}
             },
@@ -383,6 +498,10 @@ fn draw_host_view(
         execute!(stdout, Print(format!("{}\r\n", text)))?;
     } else if status.scan_complete {
         execute!(stdout, Print("Scan complete\r\n"))?;
+    }
+
+    if let Some(message) = status.status_message {
+        execute!(stdout, Print(format!("{}\r\n", message)))?;
     }
 
     execute!(
@@ -522,6 +641,10 @@ fn draw_port_view(
 
         if let Some(text) = status.spinner_text {
             execute!(stdout, Print(format!("{}\r\n", text)))?;
+        }
+
+        if let Some(message) = status.status_message {
+            execute!(stdout, Print(format!("{}\r\n", message)))?;
         }
 
         let border = format!(
@@ -779,13 +902,11 @@ async fn scan_host_async(ip: Ipv4Addr, ports: &[u16]) -> Option<HostReport> {
                 let _ = stream.shutdown().await;
                 let service = port_service(*port);
                 let url = port_url(ip, *port, service);
-                let url_display = url
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or_else(|| "(unknown)".to_string());
+                let url_display = url.clone().unwrap_or_else(|| "(unknown)".to_string());
                 open_ports.push(PortInfo {
                     port: *port,
                     service,
+                    url,
                     url_display,
                     public_status: PublicStatus::Unknown,
                     public_label: String::from("pending"),
@@ -812,6 +933,16 @@ async fn scan_host_async(ip: Ipv4Addr, ports: &[u16]) -> Option<HostReport> {
     } else {
         Some(HostReport::new(ip, open_ports))
     }
+}
+
+fn rescan_host_blocking(ip: Ipv4Addr) -> Result<Option<HostReport>, String> {
+    let ports = default_port_list();
+    let runtime = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| err.to_string())?;
+
+    Ok(runtime.block_on(scan_host_async(ip, &ports)))
 }
 
 fn default_port_list() -> Vec<u16> {
@@ -920,13 +1051,19 @@ struct HostReport {
 }
 
 impl ScanResults {
-    fn insert_host(&mut self, host: HostReport) {
+    fn insert_host(&mut self, host: HostReport) -> usize {
         match self
             .hosts
             .binary_search_by(|existing| existing.ip_addr.cmp(&host.ip_addr))
         {
-            Ok(idx) => self.hosts[idx] = host,
-            Err(idx) => self.hosts.insert(idx, host),
+            Ok(idx) => {
+                self.hosts[idx] = host;
+                idx
+            }
+            Err(idx) => {
+                self.hosts.insert(idx, host);
+                idx
+            }
         }
     }
 }
@@ -970,6 +1107,7 @@ impl HostReport {
 struct PortInfo {
     port: u16,
     service: Option<&'static str>,
+    url: Option<String>,
     url_display: String,
     public_status: PublicStatus,
     public_label: String,
