@@ -178,7 +178,13 @@ const ACTION_ITEMS: &[ActionItem] = &[
 ];
 
 fn main() -> std::io::Result<()> {
-    let (mut scan_results, scan_rx) = match start_scan() {
+    let use_fake = env::args().any(|arg| arg == "--fake");
+
+    let (mut scan_results, scan_rx) = match if use_fake {
+        start_fake_scan()
+    } else {
+        start_scan()
+    } {
         Ok(result) => result,
         Err(err) => {
             eprintln!("Failed to start scan: {err}");
@@ -194,7 +200,7 @@ fn main() -> std::io::Result<()> {
     terminal.clear()?;
     terminal.hide_cursor()?;
 
-    let outcome = run_app(&mut terminal, &mut scan_results, scan_rx);
+    let outcome = run_app(&mut terminal, &mut scan_results, scan_rx, use_fake);
 
     terminal.show_cursor()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -260,6 +266,7 @@ fn run_app(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     scan: &mut ScanResults,
     scan_rx: Receiver<ScanMessage>,
+    fake_mode: bool,
 ) -> Result<Option<Selection>, String> {
     let mut state = ViewState::Hosts { selected: 0 };
     let mut checker = PublicAccessChecker::new();
@@ -268,7 +275,11 @@ fn run_app(
     let spinner_interval = Duration::from_millis(400);
     let mut last_tick = Instant::now();
     let mut force_draw = true;
-    let mut status_message: Option<String> = None;
+    let mut status_message: Option<String> = if fake_mode {
+        Some("Simulated network loaded (--fake).".to_string())
+    } else {
+        None
+    };
     let mut export_mode = ExportMode::Normal;
     let mut overlay = OverlayState::Hidden;
 
@@ -1301,6 +1312,151 @@ fn drain_pending_events() -> std::io::Result<()> {
         let _ = event::read()?;
     }
     Ok(())
+}
+
+fn start_fake_scan() -> Result<(ScanResults, Receiver<ScanMessage>), String> {
+    let fake_local_ip = Ipv4Addr::new(10, 42, 0, 1);
+    let hosts = build_fake_hosts(fake_local_ip);
+    let host_count = hosts.len();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let mut processed = 0usize;
+        for host in hosts {
+            processed += 1;
+            let _ = tx.send(ScanMessage::HostProgress {
+                processed,
+                report: Some(host),
+            });
+            thread::sleep(Duration::from_millis(120));
+        }
+        let _ = tx.send(ScanMessage::Finished);
+    });
+
+    let scan_results = ScanResults {
+        hosts: Vec::new(),
+        hosts_considered: 0,
+        hosts_planned: host_count,
+        local_ip: fake_local_ip,
+        scan_complete: false,
+    };
+
+    Ok((scan_results, rx))
+}
+
+fn build_fake_hosts(local_ip: Ipv4Addr) -> Vec<HostReport> {
+    let mut hosts = Vec::new();
+
+    let mut workstation = HostReport::new(
+        local_ip,
+        Some("workstation".to_string()),
+        vec![
+            fake_port(
+                22,
+                Some("SSH"),
+                Some("OpenSSH_9.3p1"),
+                None,
+                PublicStatus::NotAccessible,
+            ),
+            fake_port(
+                9000,
+                Some("HTTPS"),
+                Some("Traefik Dashboard"),
+                Some(format!("https://{local_ip}:9000/")),
+                PublicStatus::NotAccessible,
+            ),
+        ],
+    );
+    workstation.set_mac_info(
+        Some("02:42:0A:2A:00:01".to_string()),
+        Some("Demo Hardware".to_string()),
+    );
+    hosts.push(workstation);
+
+    let mut buildbox = HostReport::new(
+        Ipv4Addr::new(10, 42, 0, 12),
+        Some("buildbox".to_string()),
+        vec![
+            fake_port(
+                8080,
+                Some("HTTP"),
+                Some("Jenkins 2.452"),
+                Some("http://10.42.0.12:8080/".to_string()),
+                PublicStatus::NotAccessible,
+            ),
+            fake_port(
+                5000,
+                Some("HTTP"),
+                Some("Internal API"),
+                Some("http://10.42.0.12:5000/".to_string()),
+                PublicStatus::NotAccessible,
+            ),
+        ],
+    );
+    buildbox.set_mac_info(
+        Some("02:42:0A:2A:00:12".to_string()),
+        Some("BuildCo".to_string()),
+    );
+    hosts.push(buildbox);
+
+    let mut edge = HostReport::new(
+        Ipv4Addr::new(10, 42, 0, 30),
+        Some("edge-proxy".to_string()),
+        vec![fake_port(
+            443,
+            Some("HTTPS"),
+            Some("Envoy 1.29"),
+            Some("https://10.42.0.30/".to_string()),
+            PublicStatus::Accessible {
+                ip: "203.0.113.52".to_string(),
+                port: 443,
+            },
+        )],
+    );
+    edge.set_mac_info(
+        Some("02:42:0A:2A:00:30".to_string()),
+        Some("Edge Systems".to_string()),
+    );
+    hosts.push(edge);
+
+    let mut database = HostReport::new(
+        Ipv4Addr::new(10, 42, 0, 50),
+        None,
+        vec![fake_port(
+            5432,
+            Some("Postgres"),
+            Some("PostgreSQL 15.3"),
+            None,
+            PublicStatus::NotAccessible,
+        )],
+    );
+    database.set_mac_info(
+        Some("02:42:0A:2A:00:50".to_string()),
+        Some("DataStack".to_string()),
+    );
+    hosts.push(database);
+
+    hosts
+}
+
+fn fake_port(
+    port: u16,
+    service: Option<&'static str>,
+    fingerprint: Option<&str>,
+    url: Option<String>,
+    public_status: PublicStatus,
+) -> PortInfo {
+    let public_label = public_status.label();
+    let url_display = url.clone().unwrap_or_else(|| "-".to_string());
+    PortInfo {
+        port,
+        service,
+        fingerprint: fingerprint.map(|value| value.to_string()),
+        url,
+        url_display,
+        public_label,
+        public_status,
+    }
 }
 
 fn start_scan() -> Result<(ScanResults, Receiver<ScanMessage>), String> {
