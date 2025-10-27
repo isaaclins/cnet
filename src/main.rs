@@ -2,7 +2,7 @@ use dns_lookup::lookup_addr;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
-use std::io::{stdout, ErrorKind, Read, Stdout, Write};
+use std::io::{stdout, ErrorKind, Read};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream as BlockingTcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -16,11 +16,9 @@ use std::time::{Duration, Instant};
 
 use arboard::Clipboard;
 use crossterm::{
-    cursor::{Hide, MoveTo, Show},
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
-    style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor},
-    terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use futures::stream::{self, StreamExt};
 use get_if_addrs::{get_if_addrs, IfAddr};
@@ -33,6 +31,15 @@ use tokio::net::TcpStream as AsyncTcpStream;
 use tokio::runtime::Builder;
 use tokio::task;
 use tokio::time::timeout;
+
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Cell, Clear, Gauge, Paragraph, Row, Table, TableState, Wrap},
+    Frame, Terminal,
+};
 
 const CONNECT_TIMEOUT_MS: u64 = 200;
 const PROBE_TIMEOUT_MS: u64 = 60;
@@ -115,6 +122,61 @@ impl ExportFormat {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OverlayState {
+    Hidden,
+    ActionMenu,
+}
+
+struct ActionItem {
+    key: char,
+    label: &'static str,
+    description: &'static str,
+}
+
+const ACTION_ITEMS: &[ActionItem] = &[
+    ActionItem {
+        key: 'r',
+        label: "Rescan Host",
+        description: "Probe the highlighted host again",
+    },
+    ActionItem {
+        key: 'd',
+        label: "Resolve Hostnames",
+        description: "Reverse DNS lookup for discovered hosts",
+    },
+    ActionItem {
+        key: 'm',
+        label: "Resolve MAC/Vendor",
+        description: "Read local ARP entries for hardware details",
+    },
+    ActionItem {
+        key: 'c',
+        label: "Copy Selection",
+        description: "Copy the focused IP or host:port to the clipboard",
+    },
+    ActionItem {
+        key: 'o',
+        label: "Open Service",
+        description: "Launch the selected service URL in a browser",
+    },
+    ActionItem {
+        key: 'e',
+        label: "Export Results",
+        description: "Save the scan as JSON, CSV, or Markdown",
+    },
+    ActionItem {
+        key: 'h',
+        label: "Toggle Actions",
+        description: "Show or hide this overlay",
+    },
+    ActionItem {
+        key: 'q',
+        label: "Quit",
+        description: "Exit cnet",
+    },
+];
+
 fn main() -> std::io::Result<()> {
     let (mut scan_results, scan_rx) = match start_scan() {
         Ok(result) => result,
@@ -124,13 +186,18 @@ fn main() -> std::io::Result<()> {
         }
     };
 
-    let mut stdout = stdout();
     terminal::enable_raw_mode()?;
-    execute!(stdout, EnterAlternateScreen, Hide)?;
+    let mut stdout = stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
+    terminal.hide_cursor()?;
 
-    let outcome = run_app(&mut stdout, &mut scan_results, scan_rx);
+    let outcome = run_app(&mut terminal, &mut scan_results, scan_rx);
 
-    execute!(stdout, Show, LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal::disable_raw_mode()?;
 
     match outcome {
@@ -156,14 +223,14 @@ fn main() -> std::io::Result<()> {
                             ip,
                             port: public_port,
                         } => {
-                            println!("Public endpoint: {ip}:{public_port}")
+                            println!("Public endpoint: {ip}:{public_port}");
                         }
                         PublicStatus::NotAccessible => {
-                            println!("Public endpoint: not reachable")
+                            println!("Public endpoint: not reachable");
                         }
                         PublicStatus::Unknown => println!("Public endpoint: unknown"),
                         PublicStatus::Error(msg) => {
-                            println!("Public check failed: {msg}")
+                            println!("Public check failed: {msg}");
                         }
                     }
                 } else {
@@ -190,7 +257,7 @@ fn main() -> std::io::Result<()> {
 }
 
 fn run_app(
-    stdout: &mut Stdout,
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     scan: &mut ScanResults,
     scan_rx: Receiver<ScanMessage>,
 ) -> Result<Option<Selection>, String> {
@@ -202,7 +269,8 @@ fn run_app(
     let mut last_tick = Instant::now();
     let mut force_draw = true;
     let mut status_message: Option<String> = None;
-        let mut export_mode = ExportMode::Normal;
+    let mut export_mode = ExportMode::Normal;
+    let mut overlay = OverlayState::Hidden;
 
     drain_pending_events().map_err(|err| err.to_string())?;
 
@@ -245,7 +313,19 @@ fn run_app(
                 scan_complete: scan.scan_complete,
                 status_message: status_message.as_deref(),
             };
-            draw(stdout, &state, scan, &mut checker, &status).map_err(|err| err.to_string())?;
+            terminal
+                .draw(|frame| {
+                    render_ui(
+                        frame,
+                        &state,
+                        scan,
+                        &mut checker,
+                        &status,
+                        overlay,
+                        export_mode,
+                    );
+                })
+                .map_err(|err| err.to_string())?;
             force_draw = false;
         }
 
@@ -256,125 +336,81 @@ fn run_app(
 
         let mut state_changed = false;
         match event::read() {
-            Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => match key.code {
-                KeyCode::Char('j') | KeyCode::Char('J')
-                    if matches!(export_mode, ExportMode::ChoosingFormat) =>
-                {
-                    export_mode = ExportMode::Normal;
-                    match export_scan_results(scan, ExportFormat::Json) {
-                        Ok(path) => {
-                            status_message = Some(format!(
-                                "Exported JSON to {}",
-                                human_display_path(&path)
-                            ));
-                        }
-                        Err(err) => {
-                            status_message = Some(format!(
-                                "JSON export failed: {}",
-                                err
-                            ));
-                        }
-                    }
-                    force_draw = true;
-                    continue;
-                }
-                KeyCode::Char('c') | KeyCode::Char('C')
-                    if matches!(export_mode, ExportMode::ChoosingFormat) =>
-                {
-                    export_mode = ExportMode::Normal;
-                    match export_scan_results(scan, ExportFormat::Csv) {
-                        Ok(path) => {
-                            status_message = Some(format!(
-                                "Exported CSV to {}",
-                                human_display_path(&path)
-                            ));
-                        }
-                        Err(err) => {
-                            status_message = Some(format!(
-                                "CSV export failed: {}",
-                                err
-                            ));
-                        }
-                    }
-                    force_draw = true;
-                    continue;
-                }
-                KeyCode::Char('m') | KeyCode::Char('M')
-                    if matches!(export_mode, ExportMode::ChoosingFormat) =>
-                {
-                    export_mode = ExportMode::Normal;
-                    match export_scan_results(scan, ExportFormat::Markdown) {
-                        Ok(path) => {
-                            status_message = Some(format!(
-                                "Exported Markdown to {}",
-                                human_display_path(&path)
-                            ));
-                        }
-                        Err(err) => {
-                            status_message = Some(format!(
-                                "Markdown export failed: {}",
-                                err
-                            ));
-                        }
-                    }
-                    force_draw = true;
-                    continue;
-                }
-                KeyCode::Esc if matches!(export_mode, ExportMode::ChoosingFormat) => {
-                    export_mode = ExportMode::Normal;
-                    status_message = Some("Export cancelled.".to_string());
-                    force_draw = true;
-                    continue;
-                }
-                KeyCode::Up => match &mut state {
-                    ViewState::Hosts { selected } => {
-                        if !scan.hosts.is_empty() {
-                            *selected = if *selected == 0 {
-                                scan.hosts.len() - 1
-                            } else {
-                                *selected - 1
-                            };
-                            state_changed = true;
-                        }
-                    }
-                    ViewState::Ports {
-                        host_index,
-                        port_index,
-                    } => {
-                        if let Some(host) = scan.hosts.get(*host_index) {
-                            if !host.ports.is_empty() {
-                                *port_index = if *port_index == 0 {
-                                    host.ports.len() - 1
-                                } else {
-                                    *port_index - 1
-                                };
-                                state_changed = true;
+            Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                if matches!(export_mode, ExportMode::ChoosingFormat) {
+                    match key.code {
+                        KeyCode::Char('j') | KeyCode::Char('J') => {
+                            export_mode = ExportMode::Normal;
+                            match export_scan_results(scan, ExportFormat::Json) {
+                                Ok(path) => {
+                                    status_message = Some(format!(
+                                        "Exported JSON to {}",
+                                        human_display_path(&path)
+                                    ));
+                                }
+                                Err(err) => {
+                                    status_message = Some(format!("JSON export failed: {err}"));
+                                }
                             }
+                            force_draw = true;
+                            continue;
                         }
-                    }
-                },
-                KeyCode::Down => match &mut state {
-                    ViewState::Hosts { selected } => {
-                        if !scan.hosts.is_empty() {
-                            *selected = (*selected + 1) % scan.hosts.len();
-                            state_changed = true;
-                        }
-                    }
-                    ViewState::Ports {
-                        host_index,
-                        port_index,
-                    } => {
-                        if let Some(host) = scan.hosts.get(*host_index) {
-                            if !host.ports.is_empty() {
-                                *port_index = (*port_index + 1) % host.ports.len();
-                                state_changed = true;
+                        KeyCode::Char('c') | KeyCode::Char('C') => {
+                            export_mode = ExportMode::Normal;
+                            match export_scan_results(scan, ExportFormat::Csv) {
+                                Ok(path) => {
+                                    status_message = Some(format!(
+                                        "Exported CSV to {}",
+                                        human_display_path(&path)
+                                    ));
+                                }
+                                Err(err) => {
+                                    status_message = Some(format!("CSV export failed: {err}"));
+                                }
                             }
+                            force_draw = true;
+                            continue;
                         }
+                        KeyCode::Char('m') | KeyCode::Char('M') => {
+                            export_mode = ExportMode::Normal;
+                            match export_scan_results(scan, ExportFormat::Markdown) {
+                                Ok(path) => {
+                                    status_message = Some(format!(
+                                        "Exported Markdown to {}",
+                                        human_display_path(&path)
+                                    ));
+                                }
+                                Err(err) => {
+                                    status_message = Some(format!("Markdown export failed: {err}"));
+                                }
+                            }
+                            force_draw = true;
+                            continue;
+                        }
+                        KeyCode::Esc => {
+                            export_mode = ExportMode::Normal;
+                            status_message = Some("Export cancelled.".to_string());
+                            force_draw = true;
+                            continue;
+                        }
+                        _ => continue,
                     }
-                },
-                KeyCode::Left => match state {
-                    ViewState::Hosts { .. } => {
-                        if let ViewState::Hosts { selected } = &mut state {
+                }
+
+                if overlay == OverlayState::ActionMenu {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('h') | KeyCode::Char('H') => {
+                            overlay = OverlayState::Hidden;
+                            force_draw = true;
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                match key.code {
+                    KeyCode::Up => match &mut state {
+                        ViewState::Hosts { selected } => {
                             if !scan.hosts.is_empty() {
                                 *selected = if *selected == 0 {
                                     scan.hosts.len() - 1
@@ -384,336 +420,402 @@ fn run_app(
                                 state_changed = true;
                             }
                         }
-                    }
-                    ViewState::Ports { host_index, .. } => {
-                        state = ViewState::Hosts {
-                            selected: host_index.min(scan.hosts.len().saturating_sub(1)),
-                        };
-                        state_changed = true;
-                    }
-                },
-                KeyCode::Right => match &mut state {
-                    ViewState::Hosts { selected } => {
-                        if !scan.hosts.is_empty() {
-                            *selected = (*selected + 1) % scan.hosts.len();
-                            state_changed = true;
-                        }
-                    }
-                    ViewState::Ports {
-                        host_index,
-                        port_index,
-                    } => {
-                        if let Some(host) = scan.hosts.get(*host_index) {
-                            if !host.ports.is_empty() {
-                                *port_index = (*port_index + 1) % host.ports.len();
-                                state_changed = true;
-                            }
-                        }
-                    }
-                },
-                KeyCode::Backspace => {
-                    if let ViewState::Ports { host_index, .. } = state {
-                        state = ViewState::Hosts {
-                            selected: host_index.min(scan.hosts.len().saturating_sub(1)),
-                        };
-                        state_changed = true;
-                    }
-                }
-                KeyCode::Enter => match state {
-                    ViewState::Hosts { selected } => {
-                        if !scan.hosts.is_empty() {
-                            let safe_index = selected % scan.hosts.len();
-                            if let Some(host) = scan.hosts.get(safe_index) {
+                        ViewState::Ports {
+                            host_index,
+                            port_index,
+                        } => {
+                            if let Some(host) = scan.hosts.get(*host_index) {
                                 if !host.ports.is_empty() {
-                                    state = ViewState::Ports {
-                                        host_index: safe_index,
-                                        port_index: 0,
+                                    *port_index = if *port_index == 0 {
+                                        host.ports.len() - 1
+                                    } else {
+                                        *port_index - 1
                                     };
                                     state_changed = true;
                                 }
                             }
                         }
-                    }
-                    ViewState::Ports {
-                        host_index,
-                        port_index,
-                    } => {
-                        return Ok(Some(Selection {
+                    },
+                    KeyCode::Down => match &mut state {
+                        ViewState::Hosts { selected } => {
+                            if !scan.hosts.is_empty() {
+                                *selected = (*selected + 1) % scan.hosts.len();
+                                state_changed = true;
+                            }
+                        }
+                        ViewState::Ports {
                             host_index,
                             port_index,
-                        }));
-                    }
-                },
-                KeyCode::Char('r') | KeyCode::Char('R') => {
-                    if let ViewState::Hosts { selected } = &mut state {
-                        if scan.hosts.is_empty() {
-                            status_message = Some("No hosts available to rescan.".to_string());
-                        } else {
-                            let host_index = (*selected).min(scan.hosts.len() - 1);
-                            let host_ip = scan.hosts[host_index].ip_addr;
-                            let host_label = scan.hosts[host_index].ip.clone();
-                            match rescan_host_blocking(host_ip) {
-                                Ok(Some(report)) => {
-                                    let idx = scan.insert_host(report);
-                                    *selected = idx;
-                                    if let Some(updated) = scan.hosts.get(idx) {
-                                        let count = updated.ports.len();
-                                        let plural = if count == 1 { "" } else { "s" };
-                                        status_message = Some(format!(
-                                            "Rescan complete for {} ({} open port{})",
-                                            updated.ip, count, plural
-                                        ));
-                                    } else {
-                                        status_message =
-                                            Some(format!("Rescan complete for {}", host_label));
-                                    }
-                                }
-                                Ok(None) => {
-                                    let removed = scan.hosts.remove(host_index);
-                                    status_message = Some(format!(
-                                        "{} no longer has open ports; removed from list.",
-                                        removed.ip
-                                    ));
-                                    if scan.hosts.is_empty() {
-                                        *selected = 0;
-                                    } else {
-                                        let new_index = host_index.min(scan.hosts.len() - 1);
-                                        *selected = new_index;
-                                    }
-                                }
-                                Err(err) => {
-                                    status_message =
-                                        Some(format!("Rescan failed for {}: {}", host_label, err));
+                        } => {
+                            if let Some(host) = scan.hosts.get(*host_index) {
+                                if !host.ports.is_empty() {
+                                    *port_index = (*port_index + 1) % host.ports.len();
+                                    state_changed = true;
                                 }
                             }
                         }
-                        force_draw = true;
-                        state_changed = true;
+                    },
+                    KeyCode::Left => match state {
+                        ViewState::Hosts { .. } => {
+                            if let ViewState::Hosts { selected } = &mut state {
+                                if !scan.hosts.is_empty() {
+                                    *selected = if *selected == 0 {
+                                        scan.hosts.len() - 1
+                                    } else {
+                                        *selected - 1
+                                    };
+                                    state_changed = true;
+                                }
+                            }
+                        }
+                        ViewState::Ports { host_index, .. } => {
+                            state = ViewState::Hosts {
+                                selected: host_index.min(scan.hosts.len().saturating_sub(1)),
+                            };
+                            state_changed = true;
+                        }
+                    },
+                    KeyCode::Right => match &mut state {
+                        ViewState::Hosts { selected } => {
+                            if !scan.hosts.is_empty() {
+                                *selected = (*selected + 1) % scan.hosts.len();
+                                state_changed = true;
+                            }
+                        }
+                        ViewState::Ports {
+                            host_index,
+                            port_index,
+                        } => {
+                            if let Some(host) = scan.hosts.get(*host_index) {
+                                if !host.ports.is_empty() {
+                                    *port_index = (*port_index + 1) % host.ports.len();
+                                    state_changed = true;
+                                }
+                            }
+                        }
+                    },
+                    KeyCode::Backspace => {
+                        if let ViewState::Ports { host_index, .. } = state {
+                            state = ViewState::Hosts {
+                                selected: host_index.min(scan.hosts.len().saturating_sub(1)),
+                            };
+                            state_changed = true;
+                        }
                     }
-                }
-                KeyCode::Char('d') | KeyCode::Char('D') => {
-                    if matches!(state, ViewState::Hosts { .. }) {
-                        if scan.hosts.is_empty() {
-                            status_message = Some("No hosts discovered yet.".to_string());
-                        } else {
-                            let unresolved: Vec<Ipv4Addr> = scan
-                                .hosts
-                                .iter()
-                                .filter(|host| host.hostname().is_none())
-                                .map(|host| host.ip_addr)
-                                .collect();
-
-                            if unresolved.is_empty() {
-                                status_message =
-                                    Some("All hosts already have hostnames.".to_string());
+                    KeyCode::Enter => match state {
+                        ViewState::Hosts { selected } => {
+                            if !scan.hosts.is_empty() {
+                                let safe_index = selected % scan.hosts.len();
+                                if let Some(host) = scan.hosts.get(safe_index) {
+                                    if !host.ports.is_empty() {
+                                        state = ViewState::Ports {
+                                            host_index: safe_index,
+                                            port_index: 0,
+                                        };
+                                        state_changed = true;
+                                    }
+                                }
+                            }
+                        }
+                        ViewState::Ports {
+                            host_index,
+                            port_index,
+                        } => {
+                            return Ok(Some(Selection {
+                                host_index,
+                                port_index,
+                            }));
+                        }
+                    },
+                    KeyCode::Char('r') | KeyCode::Char('R') => {
+                        if let ViewState::Hosts { selected } = &mut state {
+                            if scan.hosts.is_empty() {
+                                status_message = Some("No hosts available to rescan.".to_string());
                             } else {
-                                let resolved = resolve_hostnames_blocking(&unresolved);
-                                if resolved.is_empty() {
-                                    status_message =
-                                        Some("No hostnames could be resolved.".to_string());
-                                } else {
-                                    let count = resolved.len();
-                                    for host in &mut scan.hosts {
-                                        if let Some(name) = resolved.get(&host.ip_addr) {
-                                            host.set_hostname(Some(name.clone()));
+                                let host_index = (*selected).min(scan.hosts.len() - 1);
+                                let host_ip = scan.hosts[host_index].ip_addr;
+                                let host_label = scan.hosts[host_index].ip.clone();
+                                match rescan_host_blocking(host_ip) {
+                                    Ok(Some(report)) => {
+                                        let idx = scan.insert_host(report);
+                                        *selected = idx;
+                                        if let Some(updated) = scan.hosts.get(idx) {
+                                            let count = updated.ports.len();
+                                            let plural = if count == 1 { "" } else { "s" };
+                                            status_message = Some(format!(
+                                                "Rescan complete for {} ({} open port{})",
+                                                updated.ip, count, plural
+                                            ));
+                                        } else {
+                                            status_message =
+                                                Some(format!("Rescan complete for {}", host_label));
                                         }
                                     }
-                                    let plural = if count == 1 { "" } else { "s" };
-                                    status_message =
-                                        Some(format!("Resolved {count} hostname{plural}."));
+                                    Ok(None) => {
+                                        let removed = scan.hosts.remove(host_index);
+                                        status_message = Some(format!(
+                                            "{} no longer has open ports; removed from list.",
+                                            removed.ip
+                                        ));
+                                        if scan.hosts.is_empty() {
+                                            *selected = 0;
+                                        } else {
+                                            let new_index = host_index.min(scan.hosts.len() - 1);
+                                            *selected = new_index;
+                                        }
+                                    }
+                                    Err(err) => {
+                                        status_message = Some(format!(
+                                            "Rescan failed for {}: {}",
+                                            host_label, err
+                                        ));
+                                    }
                                 }
                             }
+                            force_draw = true;
+                            state_changed = true;
+                        }
+                    }
+                    KeyCode::Char('d') | KeyCode::Char('D') => {
+                        if matches!(state, ViewState::Hosts { .. }) {
+                            if scan.hosts.is_empty() {
+                                status_message = Some("No hosts discovered yet.".to_string());
+                            } else {
+                                let unresolved: Vec<Ipv4Addr> = scan
+                                    .hosts
+                                    .iter()
+                                    .filter(|host| host.hostname().is_none())
+                                    .map(|host| host.ip_addr)
+                                    .collect();
+
+                                if unresolved.is_empty() {
+                                    status_message =
+                                        Some("All hosts already have hostnames.".to_string());
+                                } else {
+                                    let resolved = resolve_hostnames_blocking(&unresolved);
+                                    if resolved.is_empty() {
+                                        status_message =
+                                            Some("No hostnames could be resolved.".to_string());
+                                    } else {
+                                        let count = resolved.len();
+                                        for host in &mut scan.hosts {
+                                            if let Some(name) = resolved.get(&host.ip_addr) {
+                                                host.set_hostname(Some(name.clone()));
+                                            }
+                                        }
+                                        let plural = if count == 1 { "" } else { "s" };
+                                        status_message =
+                                            Some(format!("Resolved {count} hostname{plural}."));
+                                    }
+                                }
+                            }
+                            force_draw = true;
+                            state_changed = true;
+                        }
+                    }
+                    KeyCode::Char('m') | KeyCode::Char('M') => {
+                        if matches!(state, ViewState::Hosts { .. }) {
+                            if scan.hosts.is_empty() {
+                                status_message = Some("No hosts discovered yet.".to_string());
+                            } else {
+                                let ips: Vec<Ipv4Addr> =
+                                    scan.hosts.iter().map(|host| host.ip_addr).collect();
+                                match resolve_mac_addresses_blocking(&ips) {
+                                    Ok(resolved) => {
+                                        if resolved.is_empty() {
+                                            status_message = Some(
+                                                "No MAC addresses found. Try pinging the hosts first."
+                                                    .to_string(),
+                                            );
+                                        } else {
+                                            let mut updated = 0usize;
+                                            for host in &mut scan.hosts {
+                                                if let Some(info) = resolved.get(&host.ip_addr) {
+                                                    let mac_diff = match host.mac_address() {
+                                                        Some(existing) => {
+                                                            existing != info.mac.as_str()
+                                                        }
+                                                        None => true,
+                                                    };
+
+                                                    let vendor_diff = match (
+                                                        host.vendor(),
+                                                        info.vendor.as_deref(),
+                                                    ) {
+                                                        (Some(existing), Some(candidate)) => {
+                                                            existing != candidate
+                                                        }
+                                                        (Some(_), None) => false,
+                                                        (None, Some(_)) => true,
+                                                        (None, None) => false,
+                                                    };
+
+                                                    if mac_diff || vendor_diff {
+                                                        host.set_mac_info(
+                                                            Some(info.mac.clone()),
+                                                            info.vendor.clone(),
+                                                        );
+                                                        updated += 1;
+                                                    }
+                                                }
+                                            }
+
+                                            if updated == 0 {
+                                                status_message = Some(
+                                                    "MAC addresses already resolved.".to_string(),
+                                                );
+                                            } else {
+                                                let plural = if updated == 1 { "" } else { "es" };
+                                                status_message = Some(format!(
+                                                    "Resolved {updated} MAC address{plural}."
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    Err(err) => {
+                                        status_message = Some(format!("MAC lookup failed: {err}"));
+                                    }
+                                }
+                            }
+                            force_draw = true;
+                            state_changed = true;
+                        }
+                    }
+                    KeyCode::Char('e') | KeyCode::Char('E') => {
+                        if matches!(export_mode, ExportMode::ChoosingFormat) {
+                            continue;
+                        }
+
+                        if !scan.scan_complete {
+                            status_message =
+                                Some("Scan still running; export after completion.".to_string());
+                        } else {
+                            export_mode = ExportMode::ChoosingFormat;
+                            overlay = OverlayState::Hidden;
+                            status_message = Some(
+                                "Choose export format: [J] JSON, [C] CSV, [M] Markdown, Esc to cancel."
+                                    .to_string(),
+                            );
                         }
                         force_draw = true;
-                        state_changed = true;
                     }
-                }
-                KeyCode::Char('m') | KeyCode::Char('M') => {
-                    if matches!(state, ViewState::Hosts { .. }) {
-                        if scan.hosts.is_empty() {
-                            status_message = Some("No hosts discovered yet.".to_string());
-                        } else {
-                            let ips: Vec<Ipv4Addr> = scan.hosts.iter().map(|host| host.ip_addr).collect();
-                            match resolve_mac_addresses_blocking(&ips) {
-                                Ok(resolved) => {
-                                    if resolved.is_empty() {
-                                        status_message = Some(
-                                            "No MAC addresses found. Try pinging the hosts first."
-                                                .to_string(),
-                                        );
+                    KeyCode::Char('o') | KeyCode::Char('O') => {
+                        if let ViewState::Ports {
+                            host_index,
+                            port_index,
+                        } = &state
+                        {
+                            if let Some(host) = scan.hosts.get(*host_index) {
+                                if let Some(port) = host.ports.get(*port_index) {
+                                    if let Some(url) = port.url.as_ref() {
+                                        match open::that(url) {
+                                            Ok(_) => {
+                                                status_message =
+                                                    Some(format!("Opened {} in browser", url));
+                                            }
+                                            Err(err) => {
+                                                status_message = Some(format!(
+                                                    "Failed to open {}: {}",
+                                                    url, err
+                                                ));
+                                            }
+                                        }
                                     } else {
-                                        let mut updated = 0usize;
-                                        for host in &mut scan.hosts {
-                                            if let Some(info) = resolved.get(&host.ip_addr) {
-                                                let mac_diff = match host.mac_address() {
-                                                    Some(existing) => {
-                                                        existing != info.mac.as_str()
-                                                    }
-                                                    None => true,
-                                                };
-
-                                                let vendor_diff = match (
-                                                    host.vendor(),
-                                                    info.vendor.as_deref(),
-                                                ) {
-                                                    (Some(existing), Some(candidate)) => {
-                                                        existing != candidate
-                                                    }
-                                                    (Some(_), None) => false,
-                                                    (None, Some(_)) => true,
-                                                    (None, None) => false,
-                                                };
-
-                                                if mac_diff || vendor_diff {
-                                                    host.set_mac_info(
-                                                        Some(info.mac.clone()),
-                                                        info.vendor.clone(),
-                                                    );
-                                                    updated += 1;
+                                        status_message = Some(format!(
+                                            "No URL available for {} port {}",
+                                            host.ip, port.port
+                                        ));
+                                    }
+                                }
+                            }
+                            force_draw = true;
+                        }
+                    }
+                    KeyCode::Char('c') | KeyCode::Char('C') => match &state {
+                        ViewState::Hosts { selected } => {
+                            if scan.hosts.is_empty() {
+                                status_message = Some("No hosts available to copy.".to_string());
+                            } else {
+                                let host_index = (*selected).min(scan.hosts.len() - 1);
+                                if let Some(host) = scan.hosts.get(host_index) {
+                                    let clip_text = host.ip.clone();
+                                    match Clipboard::new() {
+                                        Ok(mut clipboard) => {
+                                            match clipboard.set_text(clip_text.clone()) {
+                                                Ok(()) => {
+                                                    status_message = Some(format!(
+                                                        "Copied {} to clipboard",
+                                                        clip_text
+                                                    ));
+                                                }
+                                                Err(err) => {
+                                                    status_message =
+                                                        Some(format!("Clipboard error: {}", err));
                                                 }
                                             }
                                         }
-
-                                        if updated == 0 {
-                                            status_message = Some(
-                                                "MAC addresses already resolved.".to_string(),
-                                            );
-                                        } else {
-                                            let plural = if updated == 1 { "" } else { "es" };
-                                            status_message = Some(format!(
-                                                "Resolved {updated} MAC address{plural}."
-                                            ));
+                                        Err(err) => {
+                                            status_message =
+                                                Some(format!("Clipboard unavailable: {}", err));
                                         }
                                     }
                                 }
-                                Err(err) => {
-                                    status_message = Some(format!(
-                                        "MAC lookup failed: {err}"
-                                    ));
-                                }
                             }
+                            force_draw = true;
                         }
-                        force_draw = true;
-                        state_changed = true;
-                    }
-                }
-                KeyCode::Char('e') | KeyCode::Char('E') => {
-                    if matches!(export_mode, ExportMode::ChoosingFormat) {
-                        continue;
-                    }
-
-                    if !scan.scan_complete {
-                        status_message = Some(
-                            "Scan still running; export after completion.".to_string(),
-                        );
-                    } else {
-                        export_mode = ExportMode::ChoosingFormat;
-                        status_message = Some(
-                            "Choose export format: [J] JSON, [C] CSV, [M] Markdown, Esc to cancel."
-                                .to_string(),
-                        );
-                    }
-                    force_draw = true;
-                }
-                KeyCode::Char('o') | KeyCode::Char('O') => {
-                    if let ViewState::Ports {
-                        host_index,
-                        port_index,
-                    } = &state
-                    {
-                        if let Some(host) = scan.hosts.get(*host_index) {
-                            if let Some(port) = host.ports.get(*port_index) {
-                                if let Some(url) = port.url.as_ref() {
-                                    match open::that(url) {
-                                        Ok(_) => {
-                                            status_message =
-                                                Some(format!("Opened {} in browser", url));
+                        ViewState::Ports {
+                            host_index,
+                            port_index,
+                        } => {
+                            if let Some(host) = scan.hosts.get(*host_index) {
+                                if let Some(port) = host.ports.get(*port_index) {
+                                    let clip_text = format!("{}:{}", host.ip, port.port);
+                                    match Clipboard::new() {
+                                        Ok(mut clipboard) => {
+                                            match clipboard.set_text(clip_text.clone()) {
+                                                Ok(()) => {
+                                                    status_message = Some(format!(
+                                                        "Copied {} to clipboard",
+                                                        clip_text
+                                                    ));
+                                                }
+                                                Err(err) => {
+                                                    status_message =
+                                                        Some(format!("Clipboard error: {}", err));
+                                                }
+                                            }
                                         }
                                         Err(err) => {
                                             status_message =
-                                                Some(format!("Failed to open {}: {}", url, err));
+                                                Some(format!("Clipboard unavailable: {}", err));
                                         }
                                     }
-                                } else {
-                                    status_message = Some(format!(
-                                        "No URL available for {} port {}",
-                                        host.ip, port.port
-                                    ));
                                 }
                             }
+                            force_draw = true;
                         }
-                        force_draw = true;
-                    }
-                }
-                KeyCode::Char('c') | KeyCode::Char('C') => match &state {
-                    ViewState::Hosts { selected } => {
-                        if scan.hosts.is_empty() {
-                            status_message = Some("No hosts available to copy.".to_string());
+                    },
+                    KeyCode::Char('h') | KeyCode::Char('H') => {
+                        if matches!(export_mode, ExportMode::ChoosingFormat) {
+                            status_message = Some(
+                                "Finish choosing an export format first (Esc to cancel)."
+                                    .to_string(),
+                            );
                         } else {
-                            let host_index = (*selected).min(scan.hosts.len() - 1);
-                            if let Some(host) = scan.hosts.get(host_index) {
-                                let clip_text = host.ip.clone();
-                                match Clipboard::new() {
-                                    Ok(mut clipboard) => {
-                                        match clipboard.set_text(clip_text.clone()) {
-                                            Ok(()) => {
-                                                status_message = Some(format!(
-                                                    "Copied {} to clipboard",
-                                                    clip_text
-                                                ));
-                                            }
-                                            Err(err) => {
-                                                status_message =
-                                                    Some(format!("Clipboard error: {}", err));
-                                            }
-                                        }
-                                    }
-                                    Err(err) => {
-                                        status_message =
-                                            Some(format!("Clipboard unavailable: {}", err));
-                                    }
-                                }
-                            }
+                            overlay = match overlay {
+                                OverlayState::Hidden => OverlayState::ActionMenu,
+                                OverlayState::ActionMenu => OverlayState::Hidden,
+                            };
                         }
                         force_draw = true;
                     }
-                    ViewState::Ports {
-                        host_index,
-                        port_index,
-                    } => {
-                        if let Some(host) = scan.hosts.get(*host_index) {
-                            if let Some(port) = host.ports.get(*port_index) {
-                                let clip_text = format!("{}:{}", host.ip, port.port);
-                                match Clipboard::new() {
-                                    Ok(mut clipboard) => {
-                                        match clipboard.set_text(clip_text.clone()) {
-                                            Ok(()) => {
-                                                status_message = Some(format!(
-                                                    "Copied {} to clipboard",
-                                                    clip_text
-                                                ));
-                                            }
-                                            Err(err) => {
-                                                status_message =
-                                                    Some(format!("Clipboard error: {}", err));
-                                            }
-                                        }
-                                    }
-                                    Err(err) => {
-                                        status_message =
-                                            Some(format!("Clipboard unavailable: {}", err));
-                                    }
-                                }
-                            }
-                        }
-                        force_draw = true;
-                    }
-                },
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(None),
-                _ => {}
-            },
+                    KeyCode::Esc => return Ok(None),
+                    KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(None),
+                    _ => {}
+                }
+            }
             Ok(Event::Resize(_, _)) => {
-                state_changed = true;
+                force_draw = true;
             }
             Ok(_) => {}
             Err(err) => return Err(err.to_string()),
@@ -725,181 +827,465 @@ fn run_app(
     }
 }
 
-fn drain_pending_events() -> std::io::Result<()> {
-    while event::poll(Duration::from_millis(0))? {
-        let _ = event::read()?;
-    }
-    Ok(())
-}
-
-fn draw(
-    stdout: &mut Stdout,
+fn render_ui(
+    frame: &mut Frame<'_>,
     state: &ViewState,
     scan: &mut ScanResults,
     checker: &mut PublicAccessChecker,
     status: &UiStatus,
-) -> std::io::Result<()> {
-    execute!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
-    match *state {
-        ViewState::Hosts { selected } => draw_host_view(stdout, scan, selected, status)?,
-        ViewState::Ports {
-            host_index,
-            port_index,
-        } => draw_port_view(stdout, scan, host_index, port_index, checker, status)?,
+    overlay: OverlayState,
+    export_mode: ExportMode,
+) {
+    let area = frame.size();
+    if area.width < 2 || area.height < 2 {
+        return;
     }
-    stdout.flush()?;
-    Ok(())
+
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Min(10),
+            Constraint::Length(5),
+        ])
+        .split(area);
+
+    render_status_panel(frame, scan, status, vertical[0]);
+
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(vertical[1]);
+
+    render_hosts_view(frame, scan, state, body[0]);
+    render_port_panel(frame, scan, checker, state, body[1]);
+
+    let footer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Length(2)])
+        .split(vertical[2]);
+
+    render_progress_gauge(frame, scan, status, footer[0]);
+    render_instructions(frame, state, export_mode, footer[1]);
+
+    if matches!(overlay, OverlayState::ActionMenu) {
+        draw_actions_overlay(frame, area);
+    }
 }
 
-fn draw_host_view(
-    stdout: &mut Stdout,
-    scan: &ScanResults,
-    selected: usize,
-    status: &UiStatus,
-) -> std::io::Result<()> {
-    let layout = compute_layout(scan);
+fn render_status_panel(frame: &mut Frame<'_>, scan: &ScanResults, status: &UiStatus, area: Rect) {
+    let mut lines = Vec::new();
 
-    if let Some(text) = status.spinner_text {
-        execute!(stdout, Print(format!("{}\r\n", text)))?;
+    let status_span = if let Some(text) = status.spinner_text {
+        Span::styled(
+            text.to_string(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
     } else if status.scan_complete {
-        execute!(stdout, Print("Scan complete\r\n"))?;
-    }
+        Span::styled(
+            "Scan complete".to_string(),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(
+            "Idle".to_string(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+    lines.push(Line::from(vec![status_span]));
 
-    if let Some(message) = status.status_message {
-        execute!(stdout, Print(format!("{}\r\n", message)))?;
-    }
-
-    execute!(
-        stdout,
-        Print(format!("Local IP: {}\r\n", scan.local_ip)),
-        Print(format!(
-            "Hosts probed: {} / {}\r\n",
+    lines.push(Line::from(vec![
+        Span::styled("Local IP: ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(scan.local_ip.to_string()),
+        Span::raw("   "),
+        Span::styled(
+            "Hosts probed: ",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!(
+            "{} / {}",
             scan.hosts_considered, scan.hosts_planned
         )),
-        Print(format!("Hosts with open ports: {}\r\n", scan.hosts.len())),
-        Print("\r\n"),
-    )?;
+        Span::raw("   "),
+        Span::styled(
+            "Open hosts: ",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(scan.hosts.len().to_string()),
+    ]));
 
-    if scan.hosts.is_empty() {
-        if status.scan_complete {
-            execute!(
-                stdout,
-                Print("No hosts with open ports were discovered.\r\n")
-            )?;
-        }
-        execute!(stdout, Print("\r\n"))?;
-    } else {
-        let border = format!(
-            "+{}+{}+{}+{}+{}+\r\n",
-            "-".repeat(layout.ip_width + 2),
-            "-".repeat(layout.mac_width + 2),
-            "-".repeat(layout.vendor_width + 2),
-            "-".repeat(layout.ports_width + 2),
-            "-".repeat(layout.services_width + 2)
-        );
-        let header = format!(
-            "| {:^ip_w$} | {:^mac_w$} | {:^vendor_w$} | {:^ports_w$} | {:^services_w$} |\r\n",
-            "IP Address",
-            "MAC Address",
-            "Vendor",
-            "Open Ports",
-            "Service",
-            ip_w = layout.ip_width,
-            mac_w = layout.mac_width,
-            vendor_w = layout.vendor_width,
-            ports_w = layout.ports_width,
-            services_w = layout.services_width
-        );
-
-        execute!(
-            stdout,
-            Print(border.clone()),
-            Print(header),
-            Print(border.clone())
-        )?;
-
-        let highlight = if scan.hosts.is_empty() {
-            None
-        } else {
-            Some(selected.min(scan.hosts.len() - 1))
-        };
-
-        for (row_idx, host) in scan.hosts.iter().enumerate() {
-            let ip_label = host.ip_display();
-            let line = format!(
-                "| {:<ip_w$} | {:<mac_w$} | {:<vendor_w$} | {:<ports_w$} | {:<services_w$} |\r\n",
-                ip_label,
-                host.mac_display(),
-                host.vendor_display(),
-                &host.ports_display,
-                &host.services_display,
-                ip_w = layout.ip_width,
-                mac_w = layout.mac_width,
-                vendor_w = layout.vendor_width,
-                ports_w = layout.ports_width,
-                services_w = layout.services_width
-            );
-
-            if Some(row_idx) == highlight {
-                execute!(
-                    stdout,
-                    SetForegroundColor(Color::Black),
-                    SetBackgroundColor(Color::Cyan),
-                    Print(line),
-                    ResetColor
-                )?;
-            } else {
-                execute!(stdout, Print(line))?;
-            }
-        }
-
-        execute!(stdout, Print(border.clone()))?;
-        execute!(stdout, Print("\r\n"))?;
+    if let Some(message) = status.status_message {
+        lines.push(Line::from(Span::styled(
+            message.to_string(),
+            Style::default().fg(Color::Yellow),
+        )));
     }
 
-    let total_segments = 40usize;
-    let planned = scan.hosts_planned.max(1);
-    let completed_segments = if status.scan_complete {
-        total_segments
-    } else if scan.hosts_planned == 0 {
-        0
-    } else {
-        ((scan.hosts_considered.min(planned) * total_segments) / planned).min(total_segments)
-    };
-    let bar = format!(
-        "[{}{}]",
-        "=".repeat(completed_segments),
-        "-".repeat(total_segments.saturating_sub(completed_segments))
-    );
-    execute!(stdout, Print(format!("{}\r\n\r\n", bar)))?;
-
-    execute!(
-        stdout,
-        Print(
-            "Use ↑/↓ or ←/→ to browse hosts, Enter to inspect, C to copy IP, D to resolve hostnames, M to resolve MAC/vendor, E to export results, q or Esc to quit.\r\n"
-        )
-    )?;
-
-    if status.scan_complete {
-        execute!(
-            stdout,
-            SetForegroundColor(Color::Green),
-            Print("Done scanning\r\n"),
-            ResetColor
-        )?;
-    }
-
-    Ok(())
+    let paragraph = Paragraph::new(lines)
+        .block(Block::default().title("Status").borders(Borders::ALL))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(paragraph, area);
 }
 
-fn draw_port_view(
-    stdout: &mut Stdout,
+fn render_hosts_view(frame: &mut Frame<'_>, scan: &ScanResults, state: &ViewState, area: Rect) {
+    if scan.hosts.is_empty() {
+        let message = if scan.scan_complete {
+            "No hosts with open ports were discovered."
+        } else {
+            "Scanning for hosts..."
+        };
+        let paragraph = Paragraph::new(message)
+            .style(Style::default().fg(Color::DarkGray))
+            .block(Block::default().title("Hosts").borders(Borders::ALL));
+        frame.render_widget(paragraph, area);
+        return;
+    }
+
+    let mut table_state = TableState::default();
+    let highlight = match *state {
+        ViewState::Hosts { selected } => Some(selected.min(scan.hosts.len() - 1)),
+        ViewState::Ports { host_index, .. } => Some(host_index.min(scan.hosts.len() - 1)),
+    };
+    table_state.select(highlight);
+
+    let header = Row::new(vec![
+        Cell::from("IP Address"),
+        Cell::from("MAC"),
+        Cell::from("Vendor"),
+        Cell::from("Ports"),
+        Cell::from("Services"),
+    ])
+    .style(
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    let rows = scan.hosts.iter().map(|host| {
+        Row::new(vec![
+            Cell::from(host.ip_display().to_string()),
+            Cell::from(host.mac_display().to_string()),
+            Cell::from(host.vendor_display().to_string()),
+            Cell::from(host.ports_display.clone()),
+            Cell::from(host.services_display.clone()),
+        ])
+    });
+
+    let widths = [
+        Constraint::Percentage(30),
+        Constraint::Percentage(18),
+        Constraint::Percentage(20),
+        Constraint::Percentage(12),
+        Constraint::Percentage(20),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(Block::default().title("Hosts").borders(Borders::ALL))
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+
+    frame.render_stateful_widget(table, area, &mut table_state);
+}
+
+fn render_port_panel(
+    frame: &mut Frame<'_>,
     scan: &mut ScanResults,
-    host_index: usize,
-    port_index: usize,
     checker: &mut PublicAccessChecker,
-    status: &UiStatus,
-) -> std::io::Result<()> {
+    state: &ViewState,
+    area: Rect,
+) {
+    if scan.hosts.is_empty() {
+        let paragraph = Paragraph::new("No hosts discovered yet.")
+            .style(Style::default().fg(Color::DarkGray))
+            .block(Block::default().title("Ports").borders(Borders::ALL));
+        frame.render_widget(paragraph, area);
+        return;
+    }
+
+    let host_index = match *state {
+        ViewState::Hosts { selected } => Some(selected.min(scan.hosts.len() - 1)),
+        ViewState::Ports { host_index, .. } => Some(host_index.min(scan.hosts.len() - 1)),
+    };
+
+    let Some(host_index) = host_index else {
+        let paragraph = Paragraph::new("No host selected.")
+            .style(Style::default().fg(Color::DarkGray))
+            .block(Block::default().title("Ports").borders(Borders::ALL));
+        frame.render_widget(paragraph, area);
+        return;
+    };
+
+    update_public_status(scan, checker, host_index);
+
+    let Some(host) = scan.hosts.get(host_index) else {
+        let paragraph =
+            Paragraph::new("Host no longer available. Press ← to return to the host list.")
+                .style(Style::default().fg(Color::Yellow))
+                .block(Block::default().title("Ports").borders(Borders::ALL));
+        frame.render_widget(paragraph, area);
+        return;
+    };
+
+    let block = Block::default()
+        .title(format!("Ports for {}", host.ip))
+        .borders(Borders::ALL);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let segments = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(4), Constraint::Min(1)])
+        .split(inner);
+
+    let mut summary_lines = Vec::new();
+    summary_lines.push(Line::from(vec![
+        Span::styled("Hostname: ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(host.hostname().unwrap_or("-").to_string()),
+    ]));
+    summary_lines.push(Line::from(vec![
+        Span::styled("MAC: ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(host.mac_display().to_string()),
+        Span::raw("   "),
+        Span::styled("Vendor: ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(host.vendor_display().to_string()),
+    ]));
+    summary_lines.push(Line::from(vec![
+        Span::styled("Services: ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(host.services_display.clone()),
+    ]));
+
+    frame.render_widget(
+        Paragraph::new(summary_lines).wrap(Wrap { trim: true }),
+        segments[0],
+    );
+
+    if host.ports.is_empty() {
+        let paragraph = Paragraph::new("No open ports recorded for this host.")
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(paragraph, segments[1]);
+        return;
+    }
+
+    let header = Row::new(vec![
+        Cell::from("Port"),
+        Cell::from("Service"),
+        Cell::from("URL"),
+        Cell::from("Public"),
+    ])
+    .style(
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    let rows = host.ports.iter().map(|port| {
+        Row::new(vec![
+            Cell::from(port.port.to_string()),
+            Cell::from(service_label(port)),
+            Cell::from(port.url_display.clone()),
+            Cell::from(port.public_label.clone()),
+        ])
+    });
+
+    let mut table_state = TableState::default();
+    let selected_port = match *state {
+        ViewState::Ports {
+            host_index: active_host,
+            port_index,
+        } if active_host == host_index => Some(port_index.min(host.ports.len() - 1)),
+        _ => None,
+    };
+    table_state.select(selected_port);
+
+    let widths = [
+        Constraint::Length(6),
+        Constraint::Percentage(30),
+        Constraint::Percentage(40),
+        Constraint::Percentage(24),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+
+    frame.render_stateful_widget(table, segments[1], &mut table_state);
+}
+
+fn render_progress_gauge(frame: &mut Frame<'_>, scan: &ScanResults, status: &UiStatus, area: Rect) {
+    let planned = scan.hosts_planned.max(1);
+    let ratio = (scan.hosts_considered.min(planned) as f64 / planned as f64).clamp(0.0, 1.0);
+    let label = format!(
+        "{} / {} hosts probed",
+        scan.hosts_considered, scan.hosts_planned
+    );
+
+    let gauge = Gauge::default()
+        .block(
+            Block::default()
+                .title("Scan Progress")
+                .borders(Borders::ALL),
+        )
+        .gauge_style(if status.scan_complete {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default().fg(Color::Cyan)
+        })
+        .ratio(ratio)
+        .label(label);
+
+    frame.render_widget(gauge, area);
+}
+
+fn render_instructions(
+    frame: &mut Frame<'_>,
+    state: &ViewState,
+    export_mode: ExportMode,
+    area: Rect,
+) {
+    let key = |text: &str| {
+        Span::styled(
+            text.to_string(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+
+    let lines = if matches!(export_mode, ExportMode::ChoosingFormat) {
+        vec![
+            Line::from(vec![
+                key("[J]"),
+                Span::raw(" JSON   "),
+                key("[C]"),
+                Span::raw(" CSV   "),
+                key("[M]"),
+                Span::raw(" Markdown"),
+            ]),
+            Line::from(vec![key("Esc"), Span::raw(" to cancel")]),
+        ]
+    } else {
+        let mut content = Vec::new();
+        content.push(Line::from(vec![
+            key("↑/↓"),
+            Span::raw(" navigate  "),
+            key("Enter"),
+            Span::raw(" inspect  "),
+            key("←"),
+            Span::raw(" back"),
+        ]));
+        content.push(Line::from(vec![
+            key("R"),
+            Span::raw(" rescan  "),
+            key("D"),
+            Span::raw(" resolve DNS  "),
+            key("M"),
+            Span::raw(" resolve MAC  "),
+            key("E"),
+            Span::raw(" export  "),
+            key("H"),
+            Span::raw(" actions  "),
+            key("Q"),
+            Span::raw(" quit"),
+        ]));
+
+        if matches!(*state, ViewState::Ports { .. }) {
+            content.push(Line::from(vec![
+                key("C"),
+                Span::raw(" copy host:port  "),
+                key("O"),
+                Span::raw(" open in browser"),
+            ]));
+        }
+
+        content
+    };
+
+    let paragraph = Paragraph::new(lines)
+        .block(Block::default().title("Controls").borders(Borders::ALL))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(paragraph, area);
+}
+
+fn draw_actions_overlay(frame: &mut Frame<'_>, area: Rect) {
+    if area.width < 4 || area.height < 4 {
+        return;
+    }
+
+    let overlay_area = centered_rect(60, 70, area);
+    frame.render_widget(Clear, overlay_area);
+
+    let mut lines = Vec::new();
+    for item in ACTION_ITEMS {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("[{}]", item.key.to_ascii_uppercase()),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(item.label, Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" — "),
+            Span::raw(item.description),
+        ]));
+    }
+
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title("Actions")
+                .borders(Borders::ALL)
+                .style(Style::default().bg(Color::DarkGray)),
+        )
+        .wrap(Wrap { trim: true });
+    frame.render_widget(paragraph, overlay_area);
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let horizontal = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x).saturating_div(2)),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x).saturating_div(2)),
+        ])
+        .split(area);
+
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y).saturating_div(2)),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y).saturating_div(2)),
+        ])
+        .split(horizontal[1]);
+
+    vertical[1]
+}
+
+fn update_public_status(
+    scan: &mut ScanResults,
+    checker: &mut PublicAccessChecker,
+    host_index: usize,
+) {
     if let Some(host) = scan.hosts.get_mut(host_index) {
         for port in &mut host.ports {
             if matches!(port.public_status, PublicStatus::Unknown) {
@@ -907,161 +1293,14 @@ fn draw_port_view(
                 port.set_public_status(status);
             }
         }
-
-        let layout = compute_port_layout(host);
-        let title = format!(" {} ", host.ip_display());
-        let title_border = format!("+{}+\r\n", "-".repeat(title.len()));
-        execute!(
-            stdout,
-            Print(title_border.clone()),
-            Print(format!("|{title}|\r\n")),
-            Print(title_border)
-        )?;
-
-        if let Some(text) = status.spinner_text {
-            execute!(stdout, Print(format!("{}\r\n", text)))?;
-        }
-
-        if let Some(message) = status.status_message {
-            execute!(stdout, Print(format!("{}\r\n", message)))?;
-        }
-
-        let border = format!(
-            "+{}+{}+{}+{}+\r\n",
-            "-".repeat(layout.port_width + 2),
-            "-".repeat(layout.service_width + 2),
-            "-".repeat(layout.url_width + 2),
-            "-".repeat(layout.public_width + 2)
-        );
-        let header = format!(
-            "| {:^port_w$} | {:^service_w$} | {:^url_w$} | {:^public_w$} |\r\n",
-            "Port",
-            "Service",
-            "URL",
-            "Public",
-            port_w = layout.port_width,
-            service_w = layout.service_width,
-            url_w = layout.url_width,
-            public_w = layout.public_width
-        );
-
-        execute!(
-            stdout,
-            Print(border.clone()),
-            Print(header),
-            Print(border.clone())
-        )?;
-
-        let highlight = if host.ports.is_empty() {
-            None
-        } else {
-            Some(port_index.min(host.ports.len() - 1))
-        };
-
-        for (row_idx, port) in host.ports.iter().enumerate() {
-            let label = port
-                .fingerprint
-                .as_deref()
-                .unwrap_or_else(|| port.service.unwrap_or("unknown"));
-            let line = format!(
-                "| {:>port_w$} | {:<service_w$} | {:<url_w$} | {:<public_w$} |\r\n",
-                port.port,
-                label,
-                port.url_display,
-                port.public_label,
-                port_w = layout.port_width,
-                service_w = layout.service_width,
-                url_w = layout.url_width,
-                public_w = layout.public_width
-            );
-
-            if Some(row_idx) == highlight {
-                execute!(
-                    stdout,
-                    SetForegroundColor(Color::Black),
-                    SetBackgroundColor(Color::Cyan),
-                    Print(line),
-                    ResetColor
-                )?;
-            } else {
-                execute!(stdout, Print(line))?;
-            }
-        }
-
-        execute!(stdout, Print(border))?;
-
-        execute!(
-            stdout,
-            Print(
-                "\r\nUse ↑/↓ to browse ports, Enter to finish, ← or Backspace to return, C to copy host:port, E to export results, q or Esc to quit.\r\n"
-            )
-        )?;
-
-        if status.scan_complete {
-            execute!(
-                stdout,
-                SetForegroundColor(Color::Green),
-                Print("Done scanning\r\n"),
-                ResetColor
-            )?;
-        }
-    } else {
-        execute!(
-            stdout,
-            Print("Host no longer available. Press ← to return to the host list.\r\n")
-        )?;
     }
+}
 
+fn drain_pending_events() -> std::io::Result<()> {
+    while event::poll(Duration::from_millis(0))? {
+        let _ = event::read()?;
+    }
     Ok(())
-}
-
-fn compute_port_layout(host: &HostReport) -> PortTableLayout {
-    let mut port_width = "Port".len();
-    let mut service_width = "Service".len();
-    let mut url_width = "URL".len();
-    let mut public_width = "Public".len();
-
-    for port in &host.ports {
-        port_width = port_width.max(port.port.to_string().len());
-        let label = port
-            .fingerprint
-            .as_deref()
-            .unwrap_or_else(|| port.service.unwrap_or("unknown"));
-        service_width = service_width.max(label.len());
-        url_width = url_width.max(port.url_display.len());
-        public_width = public_width.max(port.public_label.len());
-    }
-
-    PortTableLayout {
-        port_width,
-        service_width,
-        url_width,
-        public_width,
-    }
-}
-
-fn compute_layout(scan: &ScanResults) -> TableLayout {
-    let mut ip_width = "IP Address".len();
-    let mut mac_width = "MAC Address".len();
-    let mut vendor_width = "Vendor".len();
-    let mut ports_width = "Open Ports".len();
-    let mut services_width = "Service".len();
-
-    for host in &scan.hosts {
-        ip_width = ip_width.max(host.ip_display().len());
-        mac_width = mac_width.max(host.mac_display().len());
-        vendor_width = vendor_width.max(host.vendor_display().len());
-        ports_width = ports_width.max(host.ports_display.len());
-        services_width = services_width.max(host.services_display.len());
-    }
-
-    TableLayout {
-        ip_width,
-        mac_width,
-        vendor_width,
-        ports_width,
-        services_width,
-    }
 }
 
 fn start_scan() -> Result<(ScanResults, Receiver<ScanMessage>), String> {
@@ -1267,9 +1506,7 @@ struct MacInfo {
     vendor: Option<String>,
 }
 
-fn resolve_mac_addresses_blocking(
-    ips: &[Ipv4Addr],
-) -> Result<HashMap<Ipv4Addr, MacInfo>, String> {
+fn resolve_mac_addresses_blocking(ips: &[Ipv4Addr]) -> Result<HashMap<Ipv4Addr, MacInfo>, String> {
     if ips.is_empty() {
         return Ok(HashMap::new());
     }
@@ -1284,12 +1521,10 @@ fn resolve_mac_addresses_blocking(
         }
 
         let vendor = lookup_vendor(&mac).map(|name| name.to_string());
-        resolved
-            .entry(ip)
-            .or_insert_with(|| MacInfo {
-                mac: mac.clone(),
-                vendor,
-            });
+        resolved.entry(ip).or_insert_with(|| MacInfo {
+            mac: mac.clone(),
+            vendor,
+        });
     }
 
     Ok(resolved)
@@ -1681,8 +1916,7 @@ fn collect_services(host: &HostReport) -> Vec<String> {
 }
 
 fn service_label(port: &PortInfo) -> String {
-    port
-        .fingerprint
+    port.fingerprint
         .clone()
         .unwrap_or_else(|| port.service.unwrap_or("unknown").to_string())
 }
@@ -2147,21 +2381,6 @@ impl PortInfo {
         self.public_status = status;
         self.public_label = self.public_status.label();
     }
-}
-
-struct TableLayout {
-    ip_width: usize,
-    mac_width: usize,
-    vendor_width: usize,
-    ports_width: usize,
-    services_width: usize,
-}
-
-struct PortTableLayout {
-    port_width: usize,
-    service_width: usize,
-    url_width: usize,
-    public_width: usize,
 }
 
 struct PublicAccessChecker {
