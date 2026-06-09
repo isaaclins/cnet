@@ -1,6 +1,6 @@
 # cnet
 A CLI Tool which helps you 'see' the 'net'...work and stuff
-
+```
 +------------------------------------------------------------------------+
 |                         192.168.1.53                                   |
 +-------------+----------------+-----------------------------------------+
@@ -15,7 +15,7 @@ A CLI Tool which helps you 'see' the 'net'...work and stuff
 | 445         | SMB            | (unknown)                               |
 | 2049        | NFS            | (unknown)                               |
 +-------------+----------------+-----------------------------------------+
-
+```
 
 
 Use ↑/↓ or ←/→ to navigate, Enter to select, q or Esc to cancel.
